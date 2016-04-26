@@ -64,6 +64,10 @@
 		} \
 	} while (0)
 
+#define RETRIED_IS_WAITING_FOR_REPLY(_link_state) \
+	((_link_state) == LS_RETRY_DOWN || (_link_state) == LS_RETRY_NODE_TIMEOUT || \
+		(_link_state) == LS_RETRYING)
+
 /* lock */
 static rw_lock_t *ref_lock;
 
@@ -109,6 +113,11 @@ int persistent_state = 0;
 
 int server_id = -1;
 
+static int ping_interval = DEFAULT_PING_INTERVAL;
+static int node_timeout = DEFAULT_NODE_TIMEOUT;
+static int ping_timeout = DEFAULT_PING_TIMEOUT;
+static int ping_retries = DEFAULT_PING_RETRIES;
+
 /* shm data*/
 static table_entry_t **tdata;
 static struct module_list *clusterer_modules;
@@ -138,7 +147,7 @@ static int set_state(int cluster_id, int machine_id, enum cl_machine_state state
 /* lists the available connections for the specified server*/
 static struct mi_root * clusterer_list(struct mi_root *root, void *param);
 static void update_db_handler(unsigned int ticks, void* param);
-static clusterer_node_t* get_nodes(int cluster_id,int proto);
+static clusterer_node_t* get_nodes(int cluster_id, int proto);
 static int clusterer_check(int cluster_id,union sockaddr_union *su, int machine_id, int proto);
 static void free_nodes(clusterer_node_t *nodes);
 static int su_ip_cmp(union sockaddr_union* s1, union sockaddr_union* s2);
@@ -146,6 +155,12 @@ static int get_my_id(void);
 static void update_nodes_handler(unsigned int ticks, void *param);
 static struct module_timestamp* create_module_timestamp(int ctime, struct module_list *module);
 static table_entry_value_t *clusterer_find_nodes(int cluster_id, int proto);
+
+static void heartbeats_timer_handler(unsigned int ticks, void *param);
+static void heartbeats_utimer_handler(utime_t ticks, void *param);
+static void heartbeats_timer(void);
+
+static void receive_clusterer_bin_packets(int packet_type, struct receive_info *ri, void *att);
 
 static int su_ip_cmp(union sockaddr_union* s1, union sockaddr_union* s2)
 {
@@ -160,6 +175,18 @@ static int su_ip_cmp(union sockaddr_union* s1, union sockaddr_union* s2)
 						s1->s.sa_family);
 			return 0;
 	}
+}
+
+static inline int gcd(int a, int b) {
+	int t;
+
+	while(b) {
+		t = a;
+		a = b;
+		b = t % b;
+	}
+
+	return a;
 }
 
 /*
@@ -177,6 +204,10 @@ static param_export_t params[] = {
 	{"db_url",		STR_PARAM,	&clusterer_db_url.s		},
 	{"db_table",		STR_PARAM,	&db_table.s		},
 	{"server_id",		INT_PARAM,	&server_id		},
+	{"ping_interval",	INT_PARAM,	&ping_interval	},
+	{"node_timeout",	INT_PARAM,	&node_timeout	},
+	{"ping_timeout",	INT_PARAM,	&ping_timeout	},
+	{"ping_retries",	INT_PARAM,	&ping_retries	},
 	{"persistent_state",	INT_PARAM,	&persistent_state	},
 	{"cluster_id_col",	STR_PARAM,	&cluster_id_col.s	},
 	{"machine_id_col",	STR_PARAM,	&machine_id_col.s	},
@@ -238,12 +269,31 @@ static int mod_init(void)
 {
 	LM_INFO("Cluster-Info  - initializing\n");
 
+	int heartbeats_timer_interval;
+
 	/* check the module params */
 	init_db_url(clusterer_db_url, 0 /*cannot be null*/);
 
 	if (server_id < 1) {
 		LM_ERR("invalid machine id\n");
 		return -1;
+	}
+
+	if (ping_interval <= 0) {
+		LM_WARN("invalid ping_interval parameter, using default value\n");
+		ping_interval = DEFAULT_PING_INTERVAL;
+	}
+	if (node_timeout < 0) {
+		LM_WARN("invalid node_timeout parameter, using default value\n");
+		node_timeout = DEFAULT_NODE_TIMEOUT;
+	}
+	if (ping_timeout <= 0) {
+		LM_WARN("invalid ping_timeout parameter, using default value\n");
+		ping_timeout = DEFAULT_PING_TIMEOUT;
+	}
+	if (ping_retries < 0) {
+		LM_WARN("invalid ping_retries parameter, using default value\n");
+		ping_retries = DEFAULT_PING_RETRIES;
 	}
 
 	if (persistent_state < 0 || persistent_state > 1) {
@@ -305,6 +355,30 @@ static int mod_init(void)
 		goto error;
 	}
 
+	heartbeats_timer_interval = gcd(ping_interval*1000, ping_timeout);
+	heartbeats_timer_interval = gcd(heartbeats_timer_interval, node_timeout*1000);
+
+	LM_DBG("Registerd heartbeats timer at %d ms\n", heartbeats_timer_interval);
+
+	if (heartbeats_timer_interval % 1000 == 0) {
+		if (register_timer("clstr-heartbeats-timer", heartbeats_timer_handler,
+			NULL, heartbeats_timer_interval/1000, TIMER_FLAG_DELAY_ON_DELAY) < 0) {
+			LM_CRIT("unable to register clusterer heartbeats timer\n");
+			goto error;
+		}
+	} else {
+		if (register_utimer("clstr-heartbeats-utimer", heartbeats_utimer_handler,
+			NULL, heartbeats_timer_interval*1000, TIMER_FLAG_DELAY_ON_DELAY) < 0) {
+			LM_CRIT("unable to register clusterer heartbeats timer\n");
+			goto error;
+		}
+	}
+
+	if (bin_register_cb("clusterer", receive_clusterer_bin_packets, NULL) < 0) {
+		LM_ERR("Cannot register clusterer binary packet callback!\n");
+		goto error;
+	}
+
 	/* everything is OK */
 	return 0;
 
@@ -347,6 +421,181 @@ static int child_init(int rank)
 	}
 
 	return 0;
+}
+
+static void heartbeats_timer_handler(unsigned int ticks, void *param) {
+	heartbeats_timer();
+}
+
+static void heartbeats_utimer_handler(utime_t ticks, void *param) {
+	heartbeats_timer();
+}
+
+static int send_heartbeat_msg(union sockaddr_union* dest, clusterer_msg_type type) {
+	static str module_name = str_init("clusterer");
+	str send_buffer;
+
+	if (bin_init(&module_name, type, BIN_VERSION) < 0) {
+		LM_ERR("Failed to init bin send buffer\n");
+		return -1;
+	}
+	bin_push_int(server_id);
+	bin_get_buffer(&send_buffer);
+
+	if (msg_send(NULL, PROTO_BIN, dest, 0, send_buffer.s,
+			send_buffer.len, 0) != 0) {
+		LM_ERR("Failed to send bin message\n");
+		return -1;
+	}
+
+	return 0;
+}
+
+static inline void heartbeats_timer(void) {
+	struct timeval now;
+	utime_t last_ping_int;
+	utime_t ping_reply_int;
+	table_entry_t *clusters_it;
+	table_entry_info_t *protos_it;
+	table_entry_value_t *node;
+
+	gettimeofday(&now, NULL);
+
+	for(clusters_it = *tdata; clusters_it; clusters_it=clusters_it->next)
+		for(protos_it = clusters_it->info; protos_it; protos_it=protos_it->next) {
+			/* currently only support PROTO_BIN */
+			if (protos_it->proto != PROTO_BIN)
+				continue;
+
+			for(node = protos_it->value; node; node=node->next) {
+				/* ping a failed node from which a ping was received */
+				if (node->link_state == LS_RETRY_DOWN_START) {
+					node->last_ping = now;
+					if (send_heartbeat_msg(&node->addr, CLUSTERER_PING) < 0) {
+						LM_ERR("Failed to send ping to node %d\n", node->machine_id);
+						if (ping_retries == 0) {
+							LM_WARN("Node %d is down\n", node->machine_id);
+							node->link_state = LS_DOWN;
+						} else {
+							node->ping_retries = ping_retries;
+							node->link_state = LS_RETRY_SEND_FAIL;
+						}
+					} else {
+						node->link_state = LS_RETRY_DOWN;
+						LM_DBG("Sent ping to node %d\n", node->machine_id);
+					}
+					continue;
+				}
+
+				ping_reply_int = node->last_pong.tv_sec*1000000 + node->last_pong.tv_usec
+					- node->last_ping.tv_sec*1000000 - node->last_ping.tv_usec;
+				last_ping_int = now.tv_sec*1000000 + now.tv_usec
+					- node->last_ping.tv_sec*1000000 - node->last_ping.tv_usec;
+
+				if (node->link_state == LS_RETRY_SEND_FAIL &&
+					last_ping_int >= ping_timeout*1000) {
+					node->last_ping = now;
+					node->ping_retries--;
+					if (send_heartbeat_msg(&node->addr, CLUSTERER_PING) < 0) {
+						LM_ERR("Failed to send ping retry to node %d\n", node->machine_id);
+						if (node->ping_retries == 0) {
+							node->link_state = LS_DOWN;
+							LM_WARN("Maximum number of retries reached, node %d is down\n",
+								node->machine_id);
+						}
+					} else {
+						LM_DBG("Sent ping to node %d\n", node->machine_id);
+						node->link_state = LS_RETRYING;
+					}
+					continue;
+				}
+
+				/* send first ping retry */
+				if ((node->link_state == LS_UP ||
+					node->link_state == LS_RETRY_DOWN ||
+					node->link_state == LS_RETRY_NODE_TIMEOUT) &&
+					(ping_reply_int >= ping_timeout*1000 || ping_reply_int <= 0) &&
+					last_ping_int >= ping_timeout*1000) {
+					if (ping_retries == 0) {
+						node->link_state = LS_DOWN;
+						LM_WARN("Pong not received, node %d is down\n", node->machine_id);
+					} else {
+						LM_WARN("Pong not received, node %d is possibly down, retrying\n",
+							node->machine_id);
+						node->last_ping = now;
+						if (send_heartbeat_msg(&node->addr, CLUSTERER_PING) < 0) {
+							LM_ERR("Failed to send ping to node %d\n", node->machine_id);
+							node->ping_retries = ping_retries;
+							node->link_state = LS_RETRY_SEND_FAIL;
+						} else {
+							LM_DBG("Sent ping retry to node %d\n", node->machine_id);
+							node->link_state = LS_RETRYING;
+							node->ping_retries = --ping_retries;
+						}
+						continue;
+					}
+				}
+
+				/* previous ping retry not replied, continue to retry */
+				if (node->link_state == LS_RETRYING &&
+					(ping_reply_int >= ping_timeout*1000 || ping_reply_int <= 0) &&
+					last_ping_int >= ping_timeout*1000) {
+					if (node->ping_retries > 0) {
+						node->last_ping = now;
+						if (send_heartbeat_msg(&node->addr, CLUSTERER_PING) < 0) {
+							LM_ERR("Failed to send ping retry to node %d\n",
+								node->machine_id);
+							node->link_state = LS_RETRY_SEND_FAIL;
+						} else {
+							LM_DBG("Sent ping retry to node %d\n", node->machine_id);
+							node->ping_retries--;
+						}
+						continue;
+					} else {
+						node->link_state = LS_DOWN;
+						LM_WARN("Pong not received, node %d is down\n", node->machine_id);
+					}
+				}
+
+				/* ping a failed node after node_timeout since last ping */
+				if (node->link_state == LS_DOWN && last_ping_int >= node_timeout*1000000) {
+					LM_INFO("Timeout passed, restart pinging node %d\n",
+						node->machine_id);
+
+					node->last_ping = now;
+					if (send_heartbeat_msg(&node->addr, CLUSTERER_PING) < 0) {
+						LM_ERR("Failed to send ping to node %d\n", node->machine_id);
+						if (ping_retries == 0) {
+							LM_WARN("Node %d is down\n", node->machine_id);
+							node->link_state = LS_DOWN;
+						} else {
+							node->ping_retries = ping_retries;
+							node->link_state = LS_RETRY_SEND_FAIL;
+						}
+					} else {
+						node->link_state = LS_RETRY_NODE_TIMEOUT;
+						LM_DBG("Sent ping to node %d\n", node->machine_id);
+					}
+					continue;
+				}
+
+				/* send regular ping */
+				if (node->link_state == LS_UP && last_ping_int >= ping_interval*1000000) {
+					node->last_ping = now;
+					if (send_heartbeat_msg(&node->addr, CLUSTERER_PING) < 0) {
+						LM_ERR("Failed to send ping to node %d\n", node->machine_id);
+						if (ping_retries == 0) {
+							LM_WARN("Node %d is down\n", node->machine_id);
+							node->link_state = LS_DOWN;
+						} else {
+							node->ping_retries = ping_retries;
+							node->link_state = LS_RETRY_SEND_FAIL;
+						}
+					} else
+						LM_DBG("Sent ping to node %d\n", node->machine_id);
+				}
+			}
+		}
 }
 
 static void update_nodes_handler(unsigned int ticks, void *param)
@@ -565,6 +814,7 @@ int add_info(table_entry_t **data, int *int_vals, unsigned long last_attempt, ch
 	value->machine_id = int_vals[INT_VALS_MACHINE_ID_COL];
 	value->id = int_vals[INT_VALS_CLUSTERER_ID_COL];
 	value->state = int_vals[INT_VALS_STATE_COL];
+	value->link_state = LS_UP;	/* assume node is initially up */
 	value->last_attempt = last_attempt;
 	value->duration = int_vals[INT_VALS_DURATION_COL];
 	value->failed_attempts = int_vals[INT_VALS_FAILED_ATTEMPTS_COL];
@@ -1344,7 +1594,6 @@ static void free_nodes(clusterer_node_t *nodes)
 {
 	clusterer_node_t *tmp;
 
-	LM_DBG("freeing all the nodes\n");
 	while (nodes) {
 		tmp = nodes;
 		nodes = nodes->next;
@@ -1354,47 +1603,27 @@ static void free_nodes(clusterer_node_t *nodes)
 
 static clusterer_node_t* get_nodes(int cluster_id, int proto)
 {
-	clusterer_node_t* tmp;
-	clusterer_node_t* nodes = NULL;
-	table_entry_value_t* head;
-	unsigned long ctime = time(0);
+	clusterer_node_t *tmp, *ret_nodes = NULL;
+	table_entry_value_t *node;
 
 	lock_start_read(ref_lock);
 
-	head = clusterer_find_nodes(cluster_id, proto);
-	for (; head; head = head->next) {
-		if (head->state == 1) {
-			if (head->prev_no_tries != -1 &&
-				head->no_tries > 0 &&
-				head->prev_no_tries == head->no_tries) {
-				head->no_tries = 0;
-			}
-			head->prev_no_tries = head->no_tries;
-		}
+	for (node = clusterer_find_nodes(cluster_id, proto); node; node = node->next)
+		if (node->link_state == LS_UP && add_node(&ret_nodes, node, proto) < 0) {
+			lock_stop_read(ref_lock);
 
-		if (head->state == 2) {
-			if ((ctime - head->last_attempt) >= head->duration) {
-				head->last_attempt = ctime;
-				head->state = 1;
-				head->no_tries = 0;
+			while (ret_nodes) {
+				tmp = ret_nodes;
+				ret_nodes = ret_nodes->next;
+				free_node(tmp);
 			}
+
+			return NULL;
 		}
-		if (head->state == 1 && add_node(&nodes, head, proto) < 0) {
-			goto error;
-		}
-	}
 
 	lock_stop_read(ref_lock);
-	return nodes;
 
-error:
-	lock_stop_read(ref_lock);
-	while (nodes) {
-		tmp = nodes;
-		nodes = nodes->next;
-		free_node(tmp);
-	}
-	return NULL;
+	return ret_nodes;
 }
 
 int clusterer_check(int cluster_id, union sockaddr_union* su, int machine_id, int proto)
@@ -1490,6 +1719,77 @@ static int send_to(int cluster_id, int proto)
 	lock_stop_read(ref_lock);
 
 	return ok;
+}
+
+static table_entry_value_t *find_node_by_id(int machine_id, int proto) {
+	table_entry_t *clusters_it;
+	table_entry_info_t *protos_it;
+	table_entry_value_t *node;
+
+	for (clusters_it = *tdata; clusters_it; clusters_it=clusters_it->next)
+		for (protos_it = clusters_it->info; protos_it; protos_it=protos_it->next) {
+			if (protos_it->proto != proto)
+				continue;
+			for (node = protos_it->value; node; node=node->next)
+				if (node->machine_id == machine_id)
+					return node;
+		}
+	return NULL;
+}
+
+static void receive_clusterer_bin_packets(int packet_type, struct receive_info *ri, void *att) {
+	int source_id;
+	struct timeval now;
+	table_entry_value_t *node;
+
+	gettimeofday(&now, NULL);
+
+	if (bin_pop_int(&source_id)) {
+		LM_ERR("Failed to get source id of ping\n");
+		return;
+	}
+
+	node = find_node_by_id(source_id, PROTO_BIN);
+
+	switch (packet_type) {
+	case CLUSTERER_PONG:
+		if (!node) {
+			LM_WARN("Received pong from unknown source, id: %d\n", source_id);
+			return;
+		}
+
+		LM_DBG("Received pong from node %d\n", source_id);
+		node->last_pong = now;
+
+		if (RETRIED_IS_WAITING_FOR_REPLY(node->link_state)) {
+			LM_INFO("Node %d is back up\n", source_id);
+			node->link_state = LS_UP;
+		}
+
+		break;
+	case CLUSTERER_PING:
+		if (!node) {
+			LM_WARN("Received ping from unknown source, id: %d\n", source_id);
+			return;
+		}
+
+		/* reply with pong */
+		if (send_heartbeat_msg(&node->addr, CLUSTERER_PONG) < 0) {
+			LM_ERR("Failed to reply to ping from node %d\n", source_id);
+		} else {
+			LM_DBG("Replied to ping from node %d\n", source_id);
+		}
+
+		/* if the node was down, restart pinging */
+		if (node->link_state == LS_DOWN) {
+			LM_INFO("Received ping from failed node, restart pinging");
+			node->link_state = LS_RETRY_DOWN_START;
+		}
+
+		break;
+	default:
+		LM_WARN("Invalid clusterer binary packet command from node: %d\n", source_id);
+	}
 }
 
 static void bin_receive_packets(int packet_type, struct receive_info *ri, void *ptr)

@@ -14,6 +14,13 @@
 #define INT_VALS_NO_TRIES_COL           5
 #define INT_VALS_DURATION_COL           6
 
+#define BIN_VERSION 1
+
+#define DEFAULT_PING_INTERVAL 4
+#define DEFAULT_NODE_TIMEOUT 60
+#define DEFAULT_PING_TIMEOUT 1000 /* in milliseconds */
+#define DEFAULT_PING_RETRIES 2
+
 extern str clusterer_db_url;
 extern str db_table;
 extern str cluster_id_col;
@@ -26,7 +33,21 @@ extern str duration_col;
 extern str failed_attempts_col;
 extern str no_tries_col;
 
-/* define proper state for the machine */
+typedef enum {
+    CLUSTERER_PING,
+    CLUSTERER_PONG
+} clusterer_msg_type;
+
+typedef enum {
+    LS_UP,
+    LS_DOWN,
+    /* probing states */
+    LS_RETRY_SEND_FAIL,
+    LS_RETRY_NODE_TIMEOUT,
+    LS_RETRY_DOWN_START,
+    LS_RETRY_DOWN,
+    LS_RETRYING
+} clusterer_link_state;
 
 typedef struct table_entry_ table_entry_t;
 typedef struct table_entry_info_ table_entry_info_t;
@@ -58,6 +79,14 @@ struct table_entry_value_{
     int id;
     /* state */
     int state;
+    /* state of 'link' with this node */
+    clusterer_link_state link_state;
+    /* last pong received from this node*/
+    struct timeval last_pong;
+    /* last ping sent to this node*/
+    struct timeval last_ping;
+    /* number of ping retries */
+    int ping_retries;
     /* dirty bit */
     int dirty_bit;
     /* description string */

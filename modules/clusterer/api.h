@@ -15,10 +15,7 @@ enum cl_machine_state {
 	CLUSTERER_STATE_OFF =		2
 };
 
-
-typedef struct clusterer_node_ clusterer_node_t;
-
-struct clusterer_node_ {
+typedef struct clusterer_node {
     /* machine_id */
     int machine_id;
     /* machine state */
@@ -30,18 +27,24 @@ struct clusterer_node_ {
     /* sock address */
     union sockaddr_union addr;
     /* linker in list */
-    clusterer_node_t *next;
-};
+    struct clusterer_node *next;
+} clusterer_node_t;
 
-typedef clusterer_node_t * (*get_nodes_f) (int, int);
+/*
+ * returns the list of reachable nodes in the cluster by allocating a new list
+ * if @old_list is null, else by modifying the exiting list
+ */
+typedef clusterer_node_t *(*get_nodes_f) (int cluster_id, int proto);
+
+/* free the list returned by the get_nodes_f function */
+typedef void (*free_nodes_f) (clusterer_node_t *list);
+
 typedef int (*set_state_f) (int, int, enum cl_machine_state, int);
-typedef void (*free_nodes_f) (clusterer_node_t *);
 typedef int (*check_connection_f) (int, union sockaddr_union*, int, int);
 typedef int (*get_my_id_f) (void);
 typedef int (*send_to_f) (int, int);
 typedef int (*register_module_f) (char *, int,  void (*cb)(int, struct receive_info *, int), 
                                     int, int, int);
-
 
 struct clusterer_binds {
     get_nodes_f get_nodes;
@@ -52,9 +55,6 @@ struct clusterer_binds {
     send_to_f send_to;
     register_module_f register_module;
 };
-
-
-
 
 typedef int(*load_clusterer_f)(struct clusterer_binds *binds);
 
@@ -75,3 +75,4 @@ static inline int load_clusterer_api(struct clusterer_binds *binds) {
 }
 
 #endif	/* API_H */
+
