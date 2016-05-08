@@ -871,8 +871,8 @@ static int mod_init(void)
 	if (accept_replicated_profile_timeout <= 0)
 		accept_replicated_profile_timeout = 10;
 	
-	if(accept_repl_profiles && clusterer_api.register_module("dialog", PROTO_BIN, receive_prof_binary_packet,
-			accept_replicated_profile_timeout, repl_prof_auth_check, accept_repl_profiles) < 0){
+	if(accept_repl_profiles && clusterer_api.register_module("dialog", PROTO_BIN, receive_prof_binary_packet, 
+		repl_prof_auth_check, accept_repl_profiles) < 0){
 		LM_ERR("Cannot register binary packet callback!\n");
 		return -1;
 	}

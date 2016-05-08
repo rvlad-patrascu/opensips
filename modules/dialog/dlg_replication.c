@@ -499,7 +499,7 @@ void replicate_dialog_created(struct dlg_cell *dlg)
 	bin_push_int(dlg->legs[DLG_CALLER_LEG].last_gen_cseq);
 	bin_push_int(dlg->legs[callee_leg].last_gen_cseq);
 
-	if (clusterer_api.send_to(dialog_replicate_cluster, PROTO_BIN) < 0)
+	if (clusterer_api.send_all(dialog_replicate_cluster) < 0)
  		goto error;
 
 	if_update_stat(dlg_enable_stats,create_sent,1);
@@ -566,7 +566,7 @@ void replicate_dialog_updated(struct dlg_cell *dlg)
 	bin_push_int(dlg->legs[DLG_CALLER_LEG].last_gen_cseq);
 	bin_push_int(dlg->legs[callee_leg].last_gen_cseq);
 
-	if (clusterer_api.send_to(dialog_replicate_cluster, PROTO_BIN) < 0) {
+	if (clusterer_api.send_all(dialog_replicate_cluster) < 0) {
 		LM_ERR("replicate dialog updated failed\n");
 		return;
  	}
@@ -594,7 +594,7 @@ void replicate_dialog_deleted(struct dlg_cell *dlg)
 	bin_push_str(&dlg->legs[DLG_CALLER_LEG].tag);
 	bin_push_str(&dlg->legs[callee_idx(dlg)].tag);
 
-	if (clusterer_api.send_to(dialog_replicate_cluster, PROTO_BIN) < 0) {
+	if (clusterer_api.send_all(dialog_replicate_cluster) < 0) {
 		goto error;
  	}
 
@@ -610,16 +610,7 @@ error:
 void receive_prof_binary_packet(int packet_type, struct receive_info *ri,
 																int server_id)
 {
-	char *ip;
-	unsigned short port;
-
-	if (packet_type == SERVER_TEMP_DISABLED) {
-		get_su_info(&ri->src_su.s, ip, port);
-		LM_INFO("server: %s:%hu temporary disabled\n", ip, port);
-		return;
-	}
-
-	if (packet_type == SERVER_TIMEOUT) {
+	if (packet_type == CLUSTER_NODE_DOWN) {
 		LM_INFO("server with clusterer id %d timeout\n", server_id);
 		return;
 	}
@@ -655,9 +646,6 @@ void receive_dlg_binary_packet(int packet_type, struct receive_info *ri, void *a
 				ip, port, packet_type);
 		return;
 	}
-
-	if(!clusterer_api.check(accept_replicated_dlg, &ri->src_su, server_id, ri->proto))
-		return;
 
 	switch (packet_type) {
 	case REPLICATION_DLG_CREATED:
@@ -772,7 +760,7 @@ int repl_prof_init(void)
 /* profiles replication */
 static inline void dlg_replicate_profiles(void)
 {
-	if (clusterer_api.send_to(profile_replicate_cluster, PROTO_BIN) < 0) {
+	if (clusterer_api.send_all(profile_replicate_cluster) < 0) {
  		goto error;
 	}
 

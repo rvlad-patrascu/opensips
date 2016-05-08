@@ -656,7 +656,6 @@ static int bin_status_aux(struct mi_node *root, clusterer_node_t *nodes, int typ
 	struct mi_attr* attr;
 	str cluster_id_s;
 	str machine_id_s;
-	str state;
 
 	for (d = nodes; d; d = d->next) {
 		cluster_id_s.s = int2str(cluster_id, &cluster_id_s.len);
@@ -664,14 +663,9 @@ static int bin_status_aux(struct mi_node *root, clusterer_node_t *nodes, int typ
 			cluster_id_s.s, cluster_id_s.len);
 		if (node == NULL) goto error;
 
-		machine_id_s.s = int2str(d->machine_id, &machine_id_s.len);
+		machine_id_s.s = int2str(d->node_id, &machine_id_s.len);
 		attr = add_mi_attr(node, MI_DUP_VALUE, "Machine ID", 10,
 			machine_id_s.s, machine_id_s.len);
-		if (attr == NULL) goto error;
-
-		state.s = int2str(d->state, &state.len);
-		attr = add_mi_attr(node, MI_DUP_VALUE, "STATE", 5,
-			state.s, state.len);
 		if (attr == NULL) goto error;
 
 		if (d->description.s)
@@ -706,7 +700,7 @@ int rl_bin_status(struct mi_root *rpl_tree)
 
 	root = &rpl_tree->node;
 	if (rl_repl_cluster) {
-		nodes = clusterer_api.get_nodes(rl_repl_cluster, PROTO_BIN);
+		nodes = clusterer_api.get_nodes(rl_repl_cluster);
 		if (nodes == NULL)
 			return -1;
 		if (bin_status_aux(root, nodes, 1, rl_repl_cluster) < 0)
@@ -715,7 +709,7 @@ int rl_bin_status(struct mi_root *rpl_tree)
 	}
 
 	if (accept_repl_pipes) {
-		nodes = clusterer_api.get_nodes(accept_repl_pipes, PROTO_BIN);
+		nodes = clusterer_api.get_nodes(accept_repl_pipes);
 		if (nodes == NULL)
 			return -1;
 		if (bin_status_aux(root, nodes, 0, accept_repl_pipes) < 0)
@@ -831,20 +825,12 @@ void rl_rcv_bin(int packet_type, struct receive_info *ri, int server_id)
 	int limit;
 	int counter;
 	str name;
-	char *ip;
-	unsigned short port;
 	rl_pipe_t **pipe;
 	unsigned int hash_idx;
 	time_t now;
 	rl_repl_counter_t *destination;
 
-	if (packet_type == SERVER_TEMP_DISABLED) {
- 		get_su_info(&ri->src_su.s, ip, port);
-		LM_WARN("server: %s:%hu temporary disabled\n", ip, port);
- 		return;
- 	}
-
-	if (packet_type == SERVER_TIMEOUT) {
+	if (packet_type == CLUSTER_NODE_DOWN) {
 		LM_INFO("server with clustererer id %d timeout\n", server_id);
 		return;
 	}
@@ -990,7 +976,7 @@ int rl_repl_init(void)
 
 	if (accept_repl_pipes &&
 		clusterer_api.register_module("ratelimit", PROTO_BIN, rl_rcv_bin,
-		accept_repl_pipes_timeout, repl_pipes_auth_check, accept_repl_pipes) < 0) {
+		repl_pipes_auth_check, accept_repl_pipes) < 0) {
 		LM_ERR("Cannot register binary packet callback!\n");
 		return -1;
 	}
@@ -1000,7 +986,7 @@ int rl_repl_init(void)
 
 static inline void rl_replicate(void)
 {
-	if (clusterer_api.send_to(rl_repl_cluster, PROTO_BIN) < 0) {
+	if (clusterer_api.send_all(rl_repl_cluster) < 0) {
 		LM_INFO("ratelimit replicate failed\n");
  	}
 }

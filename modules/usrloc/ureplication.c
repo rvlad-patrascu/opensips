@@ -48,7 +48,7 @@ void replicate_urecord_insert(urecord_t *r)
 	bin_push_str(r->domain);
 	bin_push_str(&r->aor);
 
-	if (clusterer_api.send_to(ul_replicate_cluster, PROTO_BIN) < 0) {
+	if (clusterer_api.send_all(ul_replicate_cluster) < 0) {
 		LM_ERR("replicate urecord insert failed\n");
  	}
 }
@@ -65,7 +65,7 @@ void replicate_urecord_delete(urecord_t *r)
 	bin_push_str(r->domain);
 	bin_push_str(&r->aor);
 
-	if (clusterer_api.send_to(ul_replicate_cluster, PROTO_BIN) < 0) {
+	if (clusterer_api.send_all(ul_replicate_cluster) < 0) {
 		LM_ERR("replicate urecord delete failed\n");
  	}	
 }
@@ -108,7 +108,7 @@ void replicate_ucontact_insert(urecord_t *r, str *contact, ucontact_info_t *ci)
 	st.len = sizeof ci->last_modified;
 	bin_push_str(&st);
 
-	if (clusterer_api.send_to(ul_replicate_cluster, PROTO_BIN) < 0) {
+	if (clusterer_api.send_all(ul_replicate_cluster) < 0) {
 		LM_ERR("replicate ucontact insert failed\n");
  	}
 
@@ -152,7 +152,7 @@ void replicate_ucontact_update(urecord_t *r, str *contact, ucontact_info_t *ci)
 	st.len = sizeof ci->last_modified;
 	bin_push_str(&st);
 
-	if (clusterer_api.send_to(ul_replicate_cluster, PROTO_BIN) < 0) {
+	if (clusterer_api.send_all(ul_replicate_cluster) < 0) {
 		LM_ERR("replicate ucontact delete failed\n");
  	}
 }
@@ -171,7 +171,7 @@ void replicate_ucontact_delete(urecord_t *r, ucontact_t *c)
 	bin_push_str(&c->callid);
 	bin_push_int(c->cseq);
 
-	if (clusterer_api.send_to(ul_replicate_cluster, PROTO_BIN) < 0) {
+	if (clusterer_api.send_all(ul_replicate_cluster) < 0) {
 		LM_ERR("replicate ucontact delete failed\n");
  	}
 }
@@ -533,8 +533,6 @@ void receive_binary_packet(int packet_type, struct receive_info *ri, void *att)
 {
 	int rc;
 	int server_id;
-	char *ip;
-	unsigned short port;
 
 	LM_DBG("received a binary packet [%d]!\n", packet_type);
 
@@ -546,13 +544,6 @@ void receive_binary_packet(int packet_type, struct receive_info *ri, void *att)
 	rc = bin_pop_int(&server_id);
 	if (rc < 0)
 		return;
-	
-	if (!clusterer_api.check(accept_replicated_udata, &ri->src_su, server_id, ri->proto)) {
-			get_su_info(&ri->src_su.s, ip, port);
-			LM_WARN("received bin packet from unknown source: %s:%hu\n",
-				ip, port);
-			return;
-	}
 
 	switch (packet_type) {
 	case REPL_URECORD_INSERT:

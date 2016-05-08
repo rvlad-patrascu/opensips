@@ -46,7 +46,8 @@
 #include "clusterer.h"
 #include "api.h"
 
-#define DB_CAP DB_CAP_QUERY | DB_CAP_UPDATE
+#define RETRIED_IS_WAITING_FOR_REPLY(_link_state) \
+	((_link_state) == LS_RESTARTED || (_link_state) == LS_RETRYING)
 
 #define check_val( _col, _val, _type, _not_null, _is_empty_str) \
 	do { \
@@ -64,63 +65,38 @@
 		} \
 	} while (0)
 
-#define RETRIED_IS_WAITING_FOR_REPLY(_link_state) \
-	((_link_state) == LS_RETRY_DOWN || (_link_state) == LS_RETRY_NODE_TIMEOUT || \
-		(_link_state) == LS_RETRYING)
-
-/* lock */
 static rw_lock_t *ref_lock;
-
-/* time interval */
-static unsigned int prob_interval = 1;
-
 
 struct clusterer_binds clusterer_api;
 
-/* Database variables */
-
-/* DB handler */
+/* DB */
 static db_con_t *db_hdl;
-/* DB functions */
 static db_func_t dr_dbf;
 
-/* DB URL */
-str clusterer_db_url;
-/* DB TABLE */
-str db_table = str_init("clusterer");
-
-/* db_table columns */
-
-/* PK column */
-str id_col = str_init("id");
-str cluster_id_col = str_init("cluster_id");
-str machine_id_col = str_init("machine_id");
-str url_col = str_init("url");
-str state_col = str_init("state");
-
-str last_attempt_col = str_init("last_attempt");
-str duration_col = str_init("duration");
-str failed_attempts_col = str_init("failed_attempts");
-str no_tries_col = str_init("no_tries");
-
-str description_col = str_init("description");
-static db_key_t *clusterer_cluster_id_key;
-static db_val_t *clusterer_cluster_id_value;
+static str clusterer_db_url = {NULL, 0};
+static str db_table = str_init("clusterer");
+static str id_col = str_init("id");	/* PK column */
+static str cluster_id_col = str_init("cluster_id");
+static str node_id_col = str_init("node_id");
+static str url_col = str_init("url");
+static str state_col = str_init("state");
+static str no_ping_retries_col = str_init("no_ping_retries");
+static str description_col = str_init("description");
 
 static db_op_t op_eq = OP_EQ;
 
-int persistent_state = 0;
+static db_key_t *clusterer_cluster_id_key;
+static db_val_t *clusterer_cluster_id_value;
 
-int server_id = -1;
+int current_id = -1;
 
 static int ping_interval = DEFAULT_PING_INTERVAL;
 static int node_timeout = DEFAULT_NODE_TIMEOUT;
 static int ping_timeout = DEFAULT_PING_TIMEOUT;
-static int ping_retries = DEFAULT_PING_RETRIES;
 
-/* shm data*/
-static table_entry_t **tdata;
-static struct module_list *clusterer_modules;
+static cluster_info_t **cluster_list;
+
+static struct mod_registration *clusterer_reg_modules;
 
 /* initialize functions */
 static int mod_init(void);
@@ -129,53 +105,19 @@ static int child_init(int rank);
 /* destroy function */
 static void destroy(void);
 
-/* loads info from the db */
-table_entry_t* load_info(db_func_t *dr_dbf, db_con_t* db_hdl, str *db_table);
-
-/* deallocate memory */
-void free_data(table_entry_t *data);
-
-/* reloads data from the db */
-/* if persistent mode is not set the local changes are lost */
+/* MI functions */
 static struct mi_root* clusterer_reload(struct mi_root* root, void *param);
-static int reload_data();
-
-/* sets a connection state */
 static struct mi_root* clusterer_set_status(struct mi_root *cmd, void *param);
-static int set_state(int cluster_id, int machine_id, enum cl_machine_state state, int proto);
-
-/* lists the available connections for the specified server*/
 static struct mi_root * clusterer_list(struct mi_root *root, void *param);
-static void update_db_handler(unsigned int ticks, void* param);
-static clusterer_node_t* get_nodes(int cluster_id, int proto);
-static int clusterer_check(int cluster_id,union sockaddr_union *su, int machine_id, int proto);
-static void free_nodes(clusterer_node_t *nodes);
-static int su_ip_cmp(union sockaddr_union* s1, union sockaddr_union* s2);
-static int get_my_id(void);
-static void update_nodes_handler(unsigned int ticks, void *param);
-static struct module_timestamp* create_module_timestamp(int ctime, struct module_list *module);
-static table_entry_value_t *clusterer_find_nodes(int cluster_id, int proto);
 
+static inline void heartbeats_timer(void);
 static void heartbeats_timer_handler(unsigned int ticks, void *param);
 static void heartbeats_utimer_handler(utime_t ticks, void *param);
-static void heartbeats_timer(void);
-
 static void receive_clusterer_bin_packets(int packet_type, struct receive_info *ri, void *att);
 
-static int su_ip_cmp(union sockaddr_union* s1, union sockaddr_union* s2)
-{
-	if (s1->s.sa_family!=s2->s.sa_family) return 0;
-	switch(s1->s.sa_family){
-		case AF_INET:
-			return (memcmp(&s1->sin.sin_addr, &s2->sin.sin_addr, 4)==0);
-		case AF_INET6:
-			return (memcmp(&s1->sin6.sin6_addr, &s2->sin6.sin6_addr, 16)==0);
-		default:
-			LM_CRIT("unknown address family %d\n",
-						s1->s.sa_family);
-			return 0;
-	}
-}
+cluster_info_t* load_db_info(db_func_t *dr_dbf, db_con_t* db_hdl, str *db_table);
+void free_info(cluster_info_t *cl_list);
+static node_info_t *clusterer_find_nodes(int cluster_id);
 
 static inline int gcd(int a, int b) {
 	int t;
@@ -201,26 +143,20 @@ static cmd_export_t cmds[]={
  * Exported parameters
  */
 static param_export_t params[] = {
-	{"db_url",		STR_PARAM,	&clusterer_db_url.s		},
-	{"db_table",		STR_PARAM,	&db_table.s		},
-	{"server_id",		INT_PARAM,	&server_id		},
-	{"ping_interval",	INT_PARAM,	&ping_interval	},
-	{"node_timeout",	INT_PARAM,	&node_timeout	},
-	{"ping_timeout",	INT_PARAM,	&ping_timeout	},
-	{"ping_retries",	INT_PARAM,	&ping_retries	},
-	{"persistent_state",	INT_PARAM,	&persistent_state	},
-	{"cluster_id_col",	STR_PARAM,	&cluster_id_col.s	},
-	{"machine_id_col",	STR_PARAM,	&machine_id_col.s	},
-	{"clusterer_id_col",	INT_PARAM,	&id_col.s	},
-	{"state_col",		STR_PARAM,	&state_col.s		},
-	{"url_col",		STR_PARAM,	&url_col.s		},
-	{"description_col",	STR_PARAM,	&description_col.s	},
-	{"last_attempt_col",	STR_PARAM,	&last_attempt_col.s	},
-	{"duration_col",	STR_PARAM,	&duration_col.s		},
-	{"failed_attempts_col",	STR_PARAM,	&failed_attempts_col.s	},
-	{"no_tries_col",	STR_PARAM,	&no_tries_col.s		},
+	{"db_url",				STR_PARAM,	&clusterer_db_url.s		},
+	{"db_table",			STR_PARAM,	&db_table.s		},
+	{"current_id",			INT_PARAM,	&current_id		},
+	{"ping_interval",		INT_PARAM,	&ping_interval	},
+	{"node_timeout",		INT_PARAM,	&node_timeout	},
+	{"ping_timeout",		INT_PARAM,	&ping_timeout	},
+	{"cluster_id_col",		STR_PARAM,	&cluster_id_col.s	},
+	{"node_id_col",			STR_PARAM,	&node_id_col.s	},
+	{"id_col",				STR_PARAM,	&id_col.s	},
+	{"state_col",			STR_PARAM,	&state_col.s		},
+	{"url_col",				STR_PARAM,	&url_col.s		},
+	{"description_col",		STR_PARAM,	&description_col.s	},
 	{0, 0, 0}
-};	
+};
 
 /*
  * Exported MI functions
@@ -264,21 +200,18 @@ struct module_exports exports= {
 	child_init					/* per-child init function */
 };
 
-/* initialize function */
 static int mod_init(void)
 {
-	LM_INFO("Cluster-Info  - initializing\n");
-
 	int heartbeats_timer_interval;
 
-	/* check the module params */
+	LM_INFO("Clusterer initializing\n");
+
 	init_db_url(clusterer_db_url, 0 /*cannot be null*/);
 
-	if (server_id < 1) {
-		LM_ERR("invalid machine id\n");
+	if (current_id < 1) {
+		LM_CRIT("invalid current_id parameter\n");
 		return -1;
 	}
-
 	if (ping_interval <= 0) {
 		LM_WARN("invalid ping_interval parameter, using default value\n");
 		ping_interval = DEFAULT_PING_INTERVAL;
@@ -291,27 +224,6 @@ static int mod_init(void)
 		LM_WARN("invalid ping_timeout parameter, using default value\n");
 		ping_timeout = DEFAULT_PING_TIMEOUT;
 	}
-	if (ping_retries < 0) {
-		LM_WARN("invalid ping_retries parameter, using default value\n");
-		ping_retries = DEFAULT_PING_RETRIES;
-	}
-
-	if (persistent_state < 0 || persistent_state > 1) {
-		LM_WARN("invalid value for persistent state - presistence disabled\n");
-		persistent_state = 0;
-	}
-
-	db_table.len = strlen(db_table.s);
-	cluster_id_col.len = strlen(cluster_id_col.s);
-	machine_id_col.len = strlen(machine_id_col.s);
-	id_col.len = strlen(id_col.s);
-	state_col.len = strlen(state_col.s);
-	url_col.len = strlen(url_col.s);
-	description_col.len = strlen(description_col.s);
-	last_attempt_col.len = strlen(last_attempt_col.s);
-	duration_col.len = strlen(duration_col.s);
-	failed_attempts_col.len = strlen(failed_attempts_col.s);
-	no_tries_col.len = strlen(no_tries_col.s);
 
 	/* create & init lock */
 	if ((ref_lock = lock_init_rw()) == NULL) {
@@ -320,12 +232,12 @@ static int mod_init(void)
 	}
 
 	/* data pointer in shm */
-	tdata = shm_malloc(sizeof *tdata);
-	if (!tdata) {
-		LM_CRIT("failed to get shm mem for data ptr\n");
+	cluster_list = shm_malloc(sizeof *cluster_list);
+	if (!cluster_list) {
+		LM_CRIT("No more shm memory\n");
 		goto error;
 	}
-	*tdata = NULL;
+	*cluster_list = NULL;
 
 	/* bind to the mysql module */
 	if (db_bind_mod(&clusterer_db_url, &dr_dbf)) {
@@ -334,27 +246,12 @@ static int mod_init(void)
 		goto error;
 	}
 
-	if (!DB_CAPABILITY(dr_dbf, DB_CAP)) {
+	if (!DB_CAPABILITY(dr_dbf, DB_CAP_QUERY)) {
 		LM_CRIT("given SQL DB does not provide query types needed by this module!\n");
 		goto error;
 	}
 
 	/* register timer */
-	if (persistent_state) {
-		/* register function to flush changes in state */
-		if (register_timer("update database", update_db_handler,
-			NULL, prob_interval, TIMER_FLAG_DELAY_ON_DELAY) < 0) {
-			LM_CRIT("unable to synchronize with the database\n");
-			goto error;
-		}
-	}
-
-	if (register_timer("update servers", update_nodes_handler,
-		NULL, prob_interval, TIMER_FLAG_DELAY_ON_DELAY) < 0) {
-		LM_CRIT("unable to update status for incoming clients\n");
-		goto error;
-	}
-
 	heartbeats_timer_interval = gcd(ping_interval*1000, ping_timeout);
 	heartbeats_timer_interval = gcd(heartbeats_timer_interval, node_timeout*1000);
 
@@ -375,11 +272,10 @@ static int mod_init(void)
 	}
 
 	if (bin_register_cb("clusterer", receive_clusterer_bin_packets, NULL) < 0) {
-		LM_ERR("Cannot register clusterer binary packet callback!\n");
+		LM_CRIT("Cannot register clusterer binary packet callback!\n");
 		goto error;
 	}
 
-	/* everything is OK */
 	return 0;
 
 error:
@@ -387,9 +283,9 @@ error:
 		lock_destroy_rw(ref_lock);
 		ref_lock = 0;
 	}
-	if (tdata) {
-		shm_free(tdata);
-		tdata = 0;
+	if (cluster_list) {
+		shm_free(cluster_list);
+		cluster_list = 0;
 	}
 	return -1;
 }
@@ -397,27 +293,22 @@ error:
 /* initialize child */
 static int child_init(int rank)
 {
-	LM_DBG("initializing child %d\n", rank);
-
 	if (rank == PROC_TCP_MAIN || rank == PROC_BIN)
 		return 0;
 
 	/* init DB connection */
 	if ((db_hdl = dr_dbf.init(&clusterer_db_url)) == 0) {
-		LM_CRIT("cannot initialize database connection\n");
+		LM_ERR("cannot initialize database connection\n");
 		return -1;
 	}
 
-	/* child 1 load the routing info */
-	if ((rank == 1) && reload_data() != 0) {
-		LM_CRIT("failed to load routing data\n");
-		return -1;
-	}
-
-	/* use db_table */
-	if (dr_dbf.use_table(db_hdl, &db_table) < 0) {
-		LM_ERR("cannot select table \"%.*s\"\n", db_table.len, db_table.s);
-		return -1;
+	/* child 1 loads the clusterer DB info */
+	if (rank == 1) {
+		*cluster_list = load_db_info(&dr_dbf, db_hdl, &db_table);
+		if (*cluster_list == NULL) {
+			LM_ERR("Failed to load info from DB\n");
+			return -1;
+		}
 	}
 
 	return 0;
@@ -431,7 +322,7 @@ static void heartbeats_utimer_handler(utime_t ticks, void *param) {
 	heartbeats_timer();
 }
 
-static int send_heartbeat_msg(union sockaddr_union* dest, clusterer_msg_type type) {
+static int send_heartbeat_msg(int cluster_id, union sockaddr_union* dest, clusterer_msg_type type) {
 	static str module_name = str_init("clusterer");
 	str send_buffer;
 
@@ -439,527 +330,369 @@ static int send_heartbeat_msg(union sockaddr_union* dest, clusterer_msg_type typ
 		LM_ERR("Failed to init bin send buffer\n");
 		return -1;
 	}
-	bin_push_int(server_id);
+
+	bin_push_int(cluster_id);
+	bin_push_int(current_id);
 	bin_get_buffer(&send_buffer);
 
-	if (msg_send(NULL, PROTO_BIN, dest, 0, send_buffer.s,
-			send_buffer.len, 0) != 0) {
-		LM_ERR("Failed to send bin message\n");
+	if (msg_send(NULL, PROTO_BIN, dest, 0, send_buffer.s, send_buffer.len, 0) != 0)
 		return -1;
-	}
 
 	return 0;
+}
+
+void call_mods_cbs(node_info_t *node, int cmd_type)
+{
+	struct cluster_mod *m_it = node->cluster->modules;
+
+	while (m_it) {
+		m_it->reg->cb(cmd_type, NULL, node->node_id);
+		m_it = m_it->next;
+	}
 }
 
 static inline void heartbeats_timer(void) {
 	struct timeval now;
 	utime_t last_ping_int;
 	utime_t ping_reply_int;
-	table_entry_t *clusters_it;
-	table_entry_info_t *protos_it;
-	table_entry_value_t *node;
+	cluster_info_t *clusters_it;
+	node_info_t *node;
 
 	gettimeofday(&now, NULL);
 
-	for(clusters_it = *tdata; clusters_it; clusters_it=clusters_it->next)
-		for(protos_it = clusters_it->info; protos_it; protos_it=protos_it->next) {
-			/* currently only support PROTO_BIN */
-			if (protos_it->proto != PROTO_BIN)
+	lock_start_write(ref_lock);
+
+	for (clusters_it = *cluster_list; clusters_it; clusters_it = clusters_it->next) {
+		if (!clusters_it->current_node->enabled)
+			continue;
+
+		for(node = clusters_it->node_list; node; node = node->next) {
+			if (!node->enabled)
 				continue;
 
-			for(node = protos_it->value; node; node=node->next) {
-				/* ping a failed node from which a ping was received */
-				if (node->link_state == LS_RETRY_DOWN_START) {
-					node->last_ping = now;
-					if (send_heartbeat_msg(&node->addr, CLUSTERER_PING) < 0) {
-						LM_ERR("Failed to send ping to node %d\n", node->machine_id);
-						if (ping_retries == 0) {
-							LM_WARN("Node %d is down\n", node->machine_id);
-							node->link_state = LS_DOWN;
-						} else {
-							node->ping_retries = ping_retries;
-							node->link_state = LS_RETRY_SEND_FAIL;
-						}
+			/* currently only support PROTO_BIN */
+			if (node->proto != PROTO_BIN)
+				continue;
+
+			/* restart pinging sequence */
+			if (node->link_state == LS_RESTART_PINGING) {
+				node->last_ping = now;
+				if (send_heartbeat_msg(clusters_it->cluster_id, &node->addr, CLUSTERER_PING) < 0) {
+					LM_ERR("Failed to send ping to node %d\n", node->node_id);
+					if (node->no_ping_retries == 0) {
+						node->link_state = LS_DOWN;
+						call_mods_cbs(node, CLUSTER_NODE_DOWN);
 					} else {
-						node->link_state = LS_RETRY_DOWN;
-						LM_DBG("Sent ping to node %d\n", node->machine_id);
+						node->curr_no_retries = node->no_ping_retries;
+						node->link_state = LS_RETRY_SEND_FAIL;
 					}
-					continue;
+				} else {
+					node->link_state = LS_RESTARTED;
+					LM_DBG("Sent ping to node %d\n", node->node_id);
 				}
+				continue;
+			}
 
-				ping_reply_int = node->last_pong.tv_sec*1000000 + node->last_pong.tv_usec
-					- node->last_ping.tv_sec*1000000 - node->last_ping.tv_usec;
-				last_ping_int = now.tv_sec*1000000 + now.tv_usec
-					- node->last_ping.tv_sec*1000000 - node->last_ping.tv_usec;
+			ping_reply_int = node->last_pong.tv_sec*1000000 + node->last_pong.tv_usec
+				- node->last_ping.tv_sec*1000000 - node->last_ping.tv_usec;
+			last_ping_int = now.tv_sec*1000000 + now.tv_usec
+				- node->last_ping.tv_sec*1000000 - node->last_ping.tv_usec;
 
-				if (node->link_state == LS_RETRY_SEND_FAIL &&
-					last_ping_int >= ping_timeout*1000) {
+			if (node->link_state == LS_RETRY_SEND_FAIL &&
+				last_ping_int >= ping_timeout*1000) {
+				node->last_ping = now;
+				node->curr_no_retries--;
+				if (send_heartbeat_msg(clusters_it->cluster_id, &node->addr, CLUSTERER_PING) < 0) {
+					LM_ERR("Failed to send ping retry to node %d\n", node->node_id);
+					if (node->curr_no_retries == 0) {
+						node->link_state = LS_DOWN;
+						LM_WARN("Maximum number of retries reached, node %d is down\n",
+							node->node_id);
+						call_mods_cbs(node, CLUSTER_NODE_DOWN);
+					}
+				} else {
+					LM_DBG("Sent ping to node %d\n", node->node_id);
+					node->link_state = LS_RETRYING;
+				}
+				continue;
+			}
+
+			/* send first ping retry */
+			if ((node->link_state == LS_UP ||
+				node->link_state == LS_RESTARTED) &&
+				(ping_reply_int >= ping_timeout*1000 || ping_reply_int <= 0) &&
+				last_ping_int >= ping_timeout*1000) {
+				if (node->no_ping_retries == 0) {
+					node->link_state = LS_DOWN;
+					LM_WARN("Pong not received, node %d is down\n", node->node_id);
+					call_mods_cbs(node, CLUSTER_NODE_DOWN);
+				} else {
+					LM_WARN("Pong not received, node %d is possibly down, retrying\n",
+						node->node_id);
 					node->last_ping = now;
-					node->ping_retries--;
-					if (send_heartbeat_msg(&node->addr, CLUSTERER_PING) < 0) {
-						LM_ERR("Failed to send ping retry to node %d\n", node->machine_id);
-						if (node->ping_retries == 0) {
-							node->link_state = LS_DOWN;
-							LM_WARN("Maximum number of retries reached, node %d is down\n",
-								node->machine_id);
-						}
+					if (send_heartbeat_msg(clusters_it->cluster_id, &node->addr, CLUSTERER_PING) < 0) {
+						LM_ERR("Failed to send ping to node %d\n", node->node_id);
+						node->curr_no_retries = node->no_ping_retries;
+						node->link_state = LS_RETRY_SEND_FAIL;
 					} else {
-						LM_DBG("Sent ping to node %d\n", node->machine_id);
+						LM_DBG("Sent ping retry to node %d\n", node->node_id);
 						node->link_state = LS_RETRYING;
+						node->curr_no_retries = --node->no_ping_retries;
 					}
 					continue;
 				}
+			}
 
-				/* send first ping retry */
-				if ((node->link_state == LS_UP ||
-					node->link_state == LS_RETRY_DOWN ||
-					node->link_state == LS_RETRY_NODE_TIMEOUT) &&
-					(ping_reply_int >= ping_timeout*1000 || ping_reply_int <= 0) &&
-					last_ping_int >= ping_timeout*1000) {
-					if (ping_retries == 0) {
-						node->link_state = LS_DOWN;
-						LM_WARN("Pong not received, node %d is down\n", node->machine_id);
-					} else {
-						LM_WARN("Pong not received, node %d is possibly down, retrying\n",
-							node->machine_id);
-						node->last_ping = now;
-						if (send_heartbeat_msg(&node->addr, CLUSTERER_PING) < 0) {
-							LM_ERR("Failed to send ping to node %d\n", node->machine_id);
-							node->ping_retries = ping_retries;
-							node->link_state = LS_RETRY_SEND_FAIL;
-						} else {
-							LM_DBG("Sent ping retry to node %d\n", node->machine_id);
-							node->link_state = LS_RETRYING;
-							node->ping_retries = --ping_retries;
-						}
-						continue;
-					}
-				}
-
-				/* previous ping retry not replied, continue to retry */
-				if (node->link_state == LS_RETRYING &&
-					(ping_reply_int >= ping_timeout*1000 || ping_reply_int <= 0) &&
-					last_ping_int >= ping_timeout*1000) {
-					if (node->ping_retries > 0) {
-						node->last_ping = now;
-						if (send_heartbeat_msg(&node->addr, CLUSTERER_PING) < 0) {
-							LM_ERR("Failed to send ping retry to node %d\n",
-								node->machine_id);
-							node->link_state = LS_RETRY_SEND_FAIL;
-						} else {
-							LM_DBG("Sent ping retry to node %d\n", node->machine_id);
-							node->ping_retries--;
-						}
-						continue;
-					} else {
-						node->link_state = LS_DOWN;
-						LM_WARN("Pong not received, node %d is down\n", node->machine_id);
-					}
-				}
-
-				/* ping a failed node after node_timeout since last ping */
-				if (node->link_state == LS_DOWN && last_ping_int >= node_timeout*1000000) {
-					LM_INFO("Timeout passed, restart pinging node %d\n",
-						node->machine_id);
-
+			/* previous ping retry not replied, continue to retry */
+			if (node->link_state == LS_RETRYING &&
+				(ping_reply_int >= ping_timeout*1000 || ping_reply_int <= 0) &&
+				last_ping_int >= ping_timeout*1000) {
+				if (node->curr_no_retries > 0) {
 					node->last_ping = now;
-					if (send_heartbeat_msg(&node->addr, CLUSTERER_PING) < 0) {
-						LM_ERR("Failed to send ping to node %d\n", node->machine_id);
-						if (ping_retries == 0) {
-							LM_WARN("Node %d is down\n", node->machine_id);
-							node->link_state = LS_DOWN;
-						} else {
-							node->ping_retries = ping_retries;
-							node->link_state = LS_RETRY_SEND_FAIL;
-						}
+					if (send_heartbeat_msg(clusters_it->cluster_id, &node->addr, CLUSTERER_PING) < 0) {
+						LM_ERR("Failed to send ping retry to node %d\n",
+							node->node_id);
+						node->link_state = LS_RETRY_SEND_FAIL;
 					} else {
-						node->link_state = LS_RETRY_NODE_TIMEOUT;
-						LM_DBG("Sent ping to node %d\n", node->machine_id);
+						LM_DBG("Sent ping retry to node %d\n", node->node_id);
+						node->curr_no_retries--;
 					}
 					continue;
-				}
-
-				/* send regular ping */
-				if (node->link_state == LS_UP && last_ping_int >= ping_interval*1000000) {
-					node->last_ping = now;
-					if (send_heartbeat_msg(&node->addr, CLUSTERER_PING) < 0) {
-						LM_ERR("Failed to send ping to node %d\n", node->machine_id);
-						if (ping_retries == 0) {
-							LM_WARN("Node %d is down\n", node->machine_id);
-							node->link_state = LS_DOWN;
-						} else {
-							node->ping_retries = ping_retries;
-							node->link_state = LS_RETRY_SEND_FAIL;
-						}
-					} else
-						LM_DBG("Sent ping to node %d\n", node->machine_id);
+				} else {
+					node->link_state = LS_DOWN;
+					LM_WARN("Pong not received, node %d is down\n", node->node_id);
+					call_mods_cbs(node, CLUSTER_NODE_DOWN);
 				}
 			}
-		}
-}
 
-static void update_nodes_handler(unsigned int ticks, void *param)
-{
-	/* data */
-	table_entry_t *head_table;
-	table_entry_info_t *info;
-	table_entry_value_t *value;
-	struct module_timestamp *head;
-	uint64_t ctime;
+			/* ping a failed node after node_timeout since last ping */
+			if (node->link_state == LS_DOWN && last_ping_int >= node_timeout*1000000) {
+				LM_INFO("Node timeout passed, restart pinging node %d\n",
+					node->node_id);
 
-	if(clusterer_modules == NULL)
-		return;
-
-	ctime = time(0);
-
-	lock_start_write(ref_lock);
-	head_table = *tdata;
-	while (head_table != NULL) {
-		info = head_table->info;
-		while (info != NULL) {
-			value = info->value;
-			while (value != NULL) {
-				head = value->in_timestamps;
-				while (head != NULL) {
-					if (head->state == CLUSTERER_STATE_PROBE && (ctime - head->timestamp) > head->up->timeout) {
-						head->up->cb(SERVER_TIMEOUT, NULL, value->id);
-						head->timestamp = head->timestamp + head->up->timeout;
-						head->state = CLUSTERER_STATE_OFF;
-					}
-					if (head->state == CLUSTERER_STATE_OFF && (ctime - head->timestamp) > head->up->duration) {
-						LM_DBG("node c_id %d m_id %d is up again\n", head_table->cluster_id, value->machine_id);
-						head->state = CLUSTERER_STATE_PROBE;
-						head->timestamp = ctime;
-					}
-					head = head->next;
-				}
-				value = value->next;
-			}
-			info = info->next;
-		}
-		head_table = head_table->next;
-	}
-	lock_stop_write(ref_lock);
-}
-
-/* synchronize backend with the db */
-static void update_db_handler(unsigned int ticks, void* param)
-{
-	/* data */
-	table_entry_t *head_table;
-	table_entry_value_t *value;
-	table_entry_info_t *info;
-	/* columns to be compared ( clusterer_id_col ) */
-	db_key_t key_cmp;
-	/* with values */
-	db_val_t val_cmp;
-	/* columns to be set */
-	db_key_t key_set[3];
-	/* with values */
-	db_val_t val_set[3];
-	int i;
-
-	CON_OR_RESET(db_hdl);
-
-	/* table to use*/
-	if (dr_dbf.use_table(db_hdl, &db_table) < 0) {
-		LM_ERR("cannot select table \"%.*s\"\n", db_table.len, db_table.s);
-		return;
-	}
-
-	val_cmp.type = DB_INT;
-	val_cmp.nul = 0;
-
-	for (i = 0; i < 2; ++i) {
-		val_set[i].type = DB_INT;
-		val_set[i].nul = 0;
-	}
-
-	val_set[2].type = DB_BIGINT;
-	val_set[2].nul = 0;
-
-	key_cmp = &id_col;
-
-	key_set[0] = &state_col;
-	key_set[1] = &no_tries_col;
-	key_set[2] = &last_attempt_col;
-
-
-	lock_start_write(ref_lock);
-
-	head_table = *tdata;
-	/* iterating through backend storage to find all data that
-	 * must be synchronized with the db */
-	while (head_table != NULL) {
-		info = head_table->info;
-		while (info != NULL) {
-			value = info->value;
-			while (value != NULL) {
-				if (value->dirty_bit == 1) {
-					LM_DBG("setting row with primary key %d the status %d\n",
-						value->id, value->state);
-
-					val_cmp.val.int_val = value->id;
-					val_set[0].val.int_val = value->state;
-					val_set[1].val.int_val = value->no_tries;
-					val_set[2].val.int_val = value->last_attempt;
-
-					/* updating */
-					if (dr_dbf.update(db_hdl, &key_cmp, &op_eq, &val_cmp, key_set, val_set, 1, 3) < 0) {
-						LM_ERR("DB update failed\n");
+				node->last_ping = now;
+				if (send_heartbeat_msg(clusters_it->cluster_id, &node->addr, CLUSTERER_PING) < 0) {
+					LM_ERR("Failed to send ping to node %d\n", node->node_id);
+					if (node->no_ping_retries == 0) {
+						node->link_state = LS_DOWN;
+						call_mods_cbs(node, CLUSTER_NODE_DOWN);
 					} else {
-						/* only if the query is successful the data is synchronized */
-						value->dirty_bit = 0;
+						node->curr_no_retries = node->no_ping_retries;
+						node->link_state = LS_RETRY_SEND_FAIL;
 					}
+				} else {
+					node->link_state = LS_RESTARTED;
+					LM_DBG("Sent ping to node %d\n", node->node_id);
 				}
-				value = value->next;
+				continue;
 			}
-			info = info->next;
+
+			/* send regular ping */
+			if (node->link_state == LS_UP && last_ping_int >= ping_interval*1000000) {
+				node->last_ping = now;
+				if (send_heartbeat_msg(clusters_it->cluster_id, &node->addr, CLUSTERER_PING) < 0) {
+					LM_ERR("Failed to send ping to node %d\n", node->node_id);
+					if (node->no_ping_retries == 0) {
+						node->link_state = LS_DOWN;
+						call_mods_cbs(node, CLUSTER_NODE_DOWN);
+					} else {
+						node->curr_no_retries = node->no_ping_retries;
+						node->link_state = LS_RETRY_SEND_FAIL;
+					}
+				} else
+					LM_DBG("Sent ping to node %d\n", node->node_id);
+			}
 		}
-		head_table = head_table->next;
 	}
 
 	lock_stop_write(ref_lock);
-
 }
 
-/* add a new information in the backend list*/
-int add_info(table_entry_t **data, int *int_vals, unsigned long last_attempt, char **str_vals)
+int add_node_info(cluster_info_t **cl_list, int *int_vals, char **str_vals)
 {
 	char *host;
 	int hlen, port;
 	struct hostent *he;
-	struct module_list *module;
-	struct module_timestamp *new_timestamp;
-	uint64_t ctime;
-	int proto;
 	int cluster_id;
-	table_entry_t *head = NULL;
-	table_entry_info_t *info_head = NULL;
-	table_entry_value_t *value = NULL;
+	cluster_info_t *cluster = NULL;
+	node_info_t *new_info = NULL;
+	struct timeval t;
 	str st;
-	char *url;
-	char *description;
-
-	if (int_vals[INT_VALS_MACHINE_ID_COL] == server_id) {
-		return 0;
-	}
-
-	url = str_vals[STR_VALS_URL_COL];
-
-	if (url == NULL) {
-		LM_ERR("no path specified\n");
-		goto error;
-	}
-
-	if (parse_phostport(url, strlen(url), &host, &hlen, &port, &proto) < 0) {
-		LM_ERR("Bad replication destination IP!\n");
-		goto error;
-	}
-
-	if (proto == PROTO_NONE)
-		proto = PROTO_UDP;
+	struct mod_registration *mod;
+	struct cluster_mod *new_cl_mod = NULL;
 
 	cluster_id = int_vals[INT_VALS_CLUSTER_ID_COL];
 
-	for (head = *data; head; head = head->next) {
-		if (head->cluster_id == cluster_id) {
-			info_head = head->info;
-			while (info_head && info_head->proto != proto)
-				info_head = info_head->next;
+	for (cluster = *cl_list; cluster && cluster->cluster_id != cluster_id;
+		cluster = cluster->next) ;
 
-			if (!info_head) {
-				info_head = shm_malloc(sizeof *info_head);
-				if (!info_head) {
-					LM_ERR("no more shm memory\n");
+	if (!cluster) {
+		cluster = shm_malloc(sizeof *cluster);
+		if (!cluster) {
+			LM_ERR("no more shm memory\n");
+			goto error;
+		}
+
+		/* look for modules that registered for this cluster */
+		for (mod = clusterer_reg_modules; mod; mod = mod->next) {
+			if (mod->accept_cluster_id == cluster_id) {
+				new_cl_mod = shm_malloc(sizeof *new_cl_mod);
+				if (!new_cl_mod) {
+					LM_ERR("No more shm memory\n");
 					goto error;
 				}
-				info_head->proto = proto;
-				info_head->next = head->info;
-				info_head->value = NULL;
-				head->info = info_head;
+
+				new_cl_mod->reg = mod;
+				new_cl_mod->next = cluster->modules;
+				cluster->modules = new_cl_mod;
 			}
-			break;
 		}
+
+		cluster->cluster_id = cluster_id;
+		cluster->node_list = NULL;
+		cluster->current_node = NULL;
+		cluster->next = *cl_list;
+		*cl_list = cluster;
 	}
 
-	if (!head) {
-		head = shm_malloc(sizeof *head);
-		if (!head) {
-			LM_ERR("no more shm memory\n");
-			goto error;
-		}
-		head->cluster_id = cluster_id;
-		head->info = shm_malloc(sizeof(table_entry_info_t));
-		if (!head->info) {
-			LM_ERR("no more shm memory\n");
-			goto error;
-		}
-		head->info->proto = proto;
-		head->info->next = NULL;
-		head->info->value = NULL;
-		info_head = head->info;
-		info_head->proto = proto;
-		head->next = *data;
-		*data = head;
-	}
-
-	/* allocating memory*/
-	value = shm_malloc(sizeof *value);
-	if (!value) {
+	new_info = shm_malloc(sizeof *new_info);
+	if (!new_info) {
 		LM_ERR("no more shm memory\n");
 		goto error;
 	}
 
-	value->machine_id = int_vals[INT_VALS_MACHINE_ID_COL];
-	value->id = int_vals[INT_VALS_CLUSTERER_ID_COL];
-	value->state = int_vals[INT_VALS_STATE_COL];
-	value->link_state = LS_UP;	/* assume node is initially up */
-	value->last_attempt = last_attempt;
-	value->duration = int_vals[INT_VALS_DURATION_COL];
-	value->failed_attempts = int_vals[INT_VALS_FAILED_ATTEMPTS_COL];
-	value->no_tries = int_vals[INT_VALS_NO_TRIES_COL];
-	value->dirty_bit = 0;
-	value->prev_no_tries = -1;
-	value->in_timestamps = NULL;
-	description = str_vals[STR_VALS_DESCRIPTION_COL];
+	new_info->id = int_vals[INT_VALS_ID_COL];
+	new_info->node_id = int_vals[INT_VALS_NODE_ID_COL];
+	new_info->enabled = int_vals[INT_VALS_STATE_COL];
 
-	value->path.s = shm_malloc(strlen(url) * sizeof(char));
+	if (int_vals[INT_VALS_NODE_ID_COL] != current_id)
+		new_info->link_state = LS_RESTART_PINGING;
+	else
+		new_info->link_state = LS_UP;
 
-	if (!value->path.s) {
-		LM_ERR("insufficient shm memory\n");
-		goto error;
-	}
-
-	st.s = host;
-	st.len = hlen;
-
-	he = sip_resolvehost(&st, (unsigned short *) &port,
-		(unsigned short *) &proto, 0, 0);
-	if (!he) {
-		LM_ERR("Cannot resolve host: %.*s\n", hlen, host);
-		goto error;
-	}
-
-	hostent2su(&value->addr, he, 0, port);
-
-	value->path.len = strlen(url);
-	memcpy(value->path.s, url, value->path.len);
-
-	if (strlen(description) != 0) {
-		value->description.len = strlen(description);
-		value->description.s = shm_malloc(value->description.len * sizeof(char));
-		if (value->description.s == NULL) {
+	if (strlen(str_vals[STR_VALS_DESCRIPTION_COL]) != 0) {
+		new_info->description.len = strlen(str_vals[STR_VALS_DESCRIPTION_COL]);
+		new_info->description.s = shm_malloc(new_info->description.len * sizeof(char));
+		if (new_info->description.s == NULL) {
 			LM_ERR("no more shm memory\n");
 			goto error;
 		}
-		memcpy(value->description.s, description, value->description.len);
+		memcpy(new_info->description.s, str_vals[STR_VALS_DESCRIPTION_COL],
+			new_info->description.len);
 	} else {
-		value->description.s = NULL;
-		value->description.len = 0;
+		new_info->description.s = NULL;
+		new_info->description.len = 0;
 	}
 
-	ctime = time(0);
-	for (module = clusterer_modules; module; module = module->next) {
-		if (cluster_id == module->accept_cluster_id && proto == module->proto) {
-			new_timestamp = create_module_timestamp(ctime, module);
-			if (new_timestamp == NULL)
-				break;
-			new_timestamp->next = value->in_timestamps;
-			value->in_timestamps = new_timestamp;
+	if (str_vals[STR_VALS_URL_COL] == NULL) {
+		LM_ERR("no url specified in DB\n");
+		goto error;
+	}
+	new_info->url.len = strlen(str_vals[STR_VALS_URL_COL]);
+	new_info->url.s = shm_malloc(strlen(str_vals[STR_VALS_URL_COL]) * sizeof(char));
+	if (!new_info->url.s) {
+		LM_ERR("no more shm memory\n");
+		goto error;
+	}
+	memcpy(new_info->url.s, str_vals[STR_VALS_URL_COL], new_info->url.len);
+
+	if (int_vals[INT_VALS_NODE_ID_COL] != current_id) {
+		if (parse_phostport(new_info->url.s, new_info->url.len, &host, &hlen, &port, &new_info->proto) < 0) {
+			LM_ERR("Bad URL!\n");
+			goto error;
 		}
+		if (new_info->proto == PROTO_NONE)
+			new_info->proto = PROTO_BIN;
+
+		st.s = host;
+		st.len = hlen;
+		he = sip_resolvehost(&st, (unsigned short *) &port,
+			(unsigned short *) &new_info->proto, 0, 0);
+		if (!he) {
+			LM_ERR("Cannot resolve host: %.*s\n", hlen, host);
+			goto error;
+		}
+
+		hostent2su(&new_info->addr, he, 0, port);
+
+		t.tv_sec = 0;
+		t.tv_usec = 0;
+		new_info->last_ping = t;
+		new_info->last_pong = t;
 	}
 
-	value->next = info_head->value;
-	info_head->value = value;
-	/* everything ok */
+	new_info->no_ping_retries = int_vals[INT_VALS_NO_PING_RETRIES_COL];
+	new_info->curr_no_retries = 0;
+
+	new_info->cluster = cluster;
+
+	if (int_vals[INT_VALS_NODE_ID_COL] != current_id) {
+		new_info->next = cluster->node_list;
+		cluster->node_list = new_info;
+	} else {
+		new_info->next = NULL;
+		cluster->current_node = new_info;
+	}
+
 	return 0;
 error:
-	if (value) {
-		if (value->description.s)
-			shm_free(value->description.s);
+	if (new_info) {
+		if (new_info->description.s)
+			shm_free(new_info->description.s);
 
-		if (value->path.s)
-			shm_free(value->path.s);
-		shm_free(value);
-	}
-	if (info_head) {
-		if (info_head->value == NULL) {
-			if (head != NULL)
-				head->info = head->info->next;
-			shm_free(info_head);
-		}
-	}
-	if (head) {
-		if (head->info == NULL) {
-			*tdata = (*tdata)->next;
-			shm_free(head);
-		}
+		if (new_info->url.s)
+			shm_free(new_info->url.s);
+
+		shm_free(new_info);
 	}
 	return -1;
 }
 
-/* loads data from the db */
-table_entry_t* load_info(db_func_t *dr_dbf, db_con_t* db_hdl, str *db_table)
+/* loads info from the db */
+cluster_info_t* load_db_info(db_func_t *dr_dbf, db_con_t* db_hdl, str *db_table)
 {
-	int int_vals[7];
-	char *str_vals[2];
-	int no_of_results;
-	int i, n;
-	int no_rows = 5;
-	int db_cols = 10;
-	unsigned long last_attempt;
-	static db_key_t clusterer_machine_id_key = &machine_id_col;
-	static db_val_t clusterer_machine_id_value = {
+	int int_vals[NO_DB_INT_VALS];
+	char *str_vals[NO_DB_STR_VALS];
+	int no_clusters;
+	int i;
+	db_key_t columns[NO_DB_COLS];	/* the columns from the db table */
+	db_res_t *res = NULL;
+	db_row_t *row;
+	cluster_info_t *cl_list = NULL;
+	static db_key_t clusterer_node_id_key = &node_id_col;
+	static db_val_t clusterer_node_id_value = {
 		.type = DB_INT,
 		.nul = 0,
 	};
 
-	VAL_INT(&clusterer_machine_id_value) = server_id;
-
-	/* the columns from the db table */
-	db_key_t columns[10];
-	/* result from a db query */
-	db_res_t* res;
-	/* a row from the db table */
-	db_row_t* row;
-	/* the processed result */
-	table_entry_t *data;
-
-	res = 0;
-	data = 0;
-
-	columns[0] = &cluster_id_col;
-	columns[1] = &machine_id_col;
-	columns[2] = &state_col;
-	columns[3] = &description_col;
-	columns[4] = &url_col;
-	columns[5] = &id_col;
-	columns[6] = &last_attempt_col;
-	columns[7] = &failed_attempts_col;
-	columns[8] = &no_tries_col;
-	columns[9] = &duration_col;
+	columns[0] = &id_col;
+	columns[1] = &cluster_id_col;
+	columns[2] = &node_id_col;
+	columns[3] = &url_col;
+	columns[4] = &state_col;
+	columns[5] = &no_ping_retries_col;
+	columns[6] = &description_col;
 
 	CON_OR_RESET(db_hdl);
 
-	/* checking if the table version is up to date*/
 	if (db_check_table_version(dr_dbf, db_hdl, db_table, 1/*version*/) != 0)
 		goto error;
 
-	/* read data */
 	if (dr_dbf->use_table(db_hdl, db_table) < 0) {
 		LM_ERR("cannot select table \"%.*s\"\n", db_table->len, db_table->s);
 		goto error;
 	}
 
-	LM_DBG("DB query - retrieve the clusters list"
-		"in which the specified server runs\n");
+	LM_DBG("DB query - retrieve the list of clusters"
+		" in which the current node runs\n");
 
-	/* first we see in which clusters the specified server runs*/
-	if (dr_dbf->query(db_hdl, &clusterer_machine_id_key, &op_eq,
-		&clusterer_machine_id_value, columns, 1, 1, 0, &res) < 0) {
-		LM_ERR("DB query failed - cannot retrieve the clusters list in which"
-			" the specified server runs\n");
+	VAL_INT(&clusterer_node_id_value) = current_id;
+
+	/* first we see in which clusters the current node runs*/
+	if (dr_dbf->query(db_hdl, &clusterer_node_id_key, &op_eq,
+		&clusterer_node_id_value, columns+1, 1, 1, 0, &res) < 0) {
+		LM_ERR("DB query failed - cannot retrieve the list of clusters in which"
+			" the current node runs\n");
 		goto error;
 	}
 
@@ -967,8 +700,8 @@ table_entry_t* load_info(db_func_t *dr_dbf, db_con_t* db_hdl, str *db_table)
 		RES_ROW_N(res), db_table->len, db_table->s);
 
 	if (RES_ROW_N(res) == 0) {
-		LM_WARN("No machines found in cluster %d\n", server_id);
-		return 0;
+		LM_WARN("No nodes found in cluster\n");
+		return NULL;
 	}
 
 	clusterer_cluster_id_key = pkg_realloc(clusterer_cluster_id_key,
@@ -983,7 +716,6 @@ table_entry_t* load_info(db_func_t *dr_dbf, db_con_t* db_hdl, str *db_table)
 
 	clusterer_cluster_id_value = pkg_realloc(clusterer_cluster_id_value,
 		RES_ROW_N(res) * sizeof(db_val_t));
-
 	if (!clusterer_cluster_id_value) {
 		LM_ERR("no more pkg memory\n");
 		goto error;
@@ -996,233 +728,115 @@ table_entry_t* load_info(db_func_t *dr_dbf, db_con_t* db_hdl, str *db_table)
 
 	for (i = 0; i < RES_ROW_N(res); i++) {
 		row = RES_ROWS(res) + i;
-
 		check_val(cluster_id_col, ROW_VALUES(row), DB_INT, 1, 0);
 		VAL_INT(clusterer_cluster_id_value + i) = VAL_INT(ROW_VALUES(row));
 	}
 
-	no_of_results = RES_ROW_N(res);
+	no_clusters = RES_ROW_N(res);
 	dr_dbf->free_result(db_hdl, res);
-	res = 0;
+	res = NULL;
 
-	LM_DBG("DB query - retrieve valid connections\n");
+	LM_DBG("DB query - retrieve nodes info\n");
 
-	/* fetch is the best strategy */
 	CON_USE_OR_OP(db_hdl);
-	if (DB_CAPABILITY(*dr_dbf, DB_CAP_FETCH)) {
 
-		if (dr_dbf->query(db_hdl, clusterer_cluster_id_key, 0,
-			clusterer_cluster_id_value, columns, no_of_results, db_cols, 0, 0) < 0) {
-			LM_ERR("DB query failed - retrieve valid connections \n");
-			goto error;
-		}
-		no_rows = estimate_available_rows(4 + 4 + 4 + 64 + 4 + 45 + 4 + 8 + 4 + 4, db_cols);
-		if (no_rows == 0) no_rows = 5;
-		if (dr_dbf->fetch_result(db_hdl, &res, no_rows) < 0) {
-			LM_ERR("Error fetching rows\n");
-			goto error;
-		}
-	} else {
-		if (dr_dbf->query(db_hdl, clusterer_cluster_id_key, 0,
-			clusterer_cluster_id_value, columns, no_of_results, db_cols, 0, &res) < 0) {
-			LM_ERR("DB query failed - retrieve valid connections\n");
-			goto error;
-		}
+	if (dr_dbf->query(db_hdl, clusterer_cluster_id_key, 0,
+		clusterer_cluster_id_value, columns, no_clusters, NO_DB_COLS, 0, &res) < 0) {
+		LM_ERR("DB query failed - retrieve valid connections\n");
+		goto error;
 	}
 
 	LM_DBG("%d rows found in %.*s\n",
 		RES_ROW_N(res), db_table->len, db_table->s);
 
-	n = 0;
-	do {
-		for (i = 0; i < RES_ROW_N(res); i++) {
-			row = RES_ROWS(res) + i;
-			/* CLUSTER ID column */
-			check_val(cluster_id_col, ROW_VALUES(row), DB_INT, 1, 0);
-			int_vals[INT_VALS_CLUSTER_ID_COL] = VAL_INT(ROW_VALUES(row));
-			/* MACHINE ID column */
-			check_val(machine_id_col, ROW_VALUES(row) + 1, DB_INT, 1, 0);
-			int_vals[INT_VALS_MACHINE_ID_COL] = VAL_INT(ROW_VALUES(row) + 1);
-			/* STATE column */
-			check_val(state_col, ROW_VALUES(row) + 2, DB_INT, 1, 0);
-			int_vals[INT_VALS_STATE_COL] = VAL_INT(ROW_VALUES(row) + 2);
-			/* DESCRIPTION column */
-			check_val(description_col, ROW_VALUES(row) + 3, DB_STRING, 0, 0);
-			str_vals[STR_VALS_DESCRIPTION_COL] = (char*) VAL_STRING(ROW_VALUES(row) + 3);
-			/* URL column */
-			check_val(url_col, ROW_VALUES(row) + 4, DB_STRING, 1, 1);
-			str_vals[STR_VALS_URL_COL] = (char*) VAL_STRING(ROW_VALUES(row) + 4);
-			/* CLUSTERER_ID column */
-			check_val(id_col, ROW_VALUES(row) + 5, DB_INT, 1, 0);
-			int_vals[INT_VALS_CLUSTERER_ID_COL] = VAL_INT(ROW_VALUES(row) + 5);
-			/* LAST_ATTEMPT column */
-			check_val(last_attempt_col, ROW_VALUES(row) + 6, DB_BIGINT, 1, 0);
-			last_attempt = VAL_BIGINT(ROW_VALUES(row) + 6);
-			/* FAILED_ATTEMPTS column */
-			check_val(failed_attempts_col, ROW_VALUES(row) + 7, DB_INT, 1, 0);
-			int_vals[INT_VALS_FAILED_ATTEMPTS_COL] = VAL_INT(ROW_VALUES(row) + 7);
-			/* NO_TRIES column */
-			check_val(no_tries_col, ROW_VALUES(row) + 8, DB_INT, 1, 0);
-			int_vals[INT_VALS_NO_TRIES_COL] = VAL_INT(ROW_VALUES(row) + 8);
-			/* DURATION column */
-			check_val(duration_col, ROW_VALUES(row) + 9, DB_INT, 1, 0);
-			int_vals[INT_VALS_DURATION_COL] = VAL_INT(ROW_VALUES(row) + 9);
+	for (i = 0; i < RES_ROW_N(res); i++) {
+		row = RES_ROWS(res) + i;
 
+		check_val(id_col, ROW_VALUES(row), DB_INT, 1, 0);
+		int_vals[INT_VALS_ID_COL] = VAL_INT(ROW_VALUES(row));
+		LM_DBG("id: %d\n", int_vals[INT_VALS_ID_COL]);
 
-			/* store data */
-			if (add_info(&data, int_vals, last_attempt, str_vals) < 0) {
-				LM_DBG("error while adding info to shm\n");
-				goto error;
-			}
+		check_val(cluster_id_col, ROW_VALUES(row) + 1, DB_INT, 1, 0);
+		int_vals[INT_VALS_CLUSTER_ID_COL] = VAL_INT(ROW_VALUES(row) + 1);
+		LM_DBG("cluster_id: %d\n", int_vals[INT_VALS_CLUSTER_ID_COL]);
 
-			LM_DBG("machine id %d\n", int_vals[0]);
-			LM_DBG("cluster id %d\n", int_vals[1]);
-			LM_DBG("state %d\n", int_vals[2]);
-			LM_DBG("clusterer_id %d\n", int_vals[3]);
-			LM_DBG("description %s\n", str_vals[0]);
-			LM_DBG("url %s\n", str_vals[1]);
+		check_val(node_id_col, ROW_VALUES(row) + 2, DB_INT, 1, 0);
+		int_vals[INT_VALS_NODE_ID_COL] = VAL_INT(ROW_VALUES(row) + 2);
+		LM_DBG("node_id: %d\n", int_vals[INT_VALS_NODE_ID_COL]);
 
-			n++;
+		check_val(url_col, ROW_VALUES(row) + 3, DB_STRING, 1, 1);
+		str_vals[STR_VALS_URL_COL] = (char*) VAL_STRING(ROW_VALUES(row) + 3);
+		LM_DBG("url: %s\n", str_vals[STR_VALS_URL_COL]);
+
+		check_val(state_col, ROW_VALUES(row) + 4, DB_INT, 1, 0);
+		int_vals[INT_VALS_STATE_COL] = VAL_INT(ROW_VALUES(row) + 4);
+		LM_DBG("state: %d\n", int_vals[INT_VALS_STATE_COL]);
+
+		check_val(no_ping_retries_col, ROW_VALUES(row) + 5, DB_INT, 1, 0);
+		int_vals[INT_VALS_NO_PING_RETRIES_COL] = VAL_INT(ROW_VALUES(row) + 5);
+		LM_DBG("no_ping_retries: %d\n", int_vals[INT_VALS_NO_PING_RETRIES_COL]);
+
+		check_val(description_col, ROW_VALUES(row) + 6, DB_STRING, 0, 0);
+		str_vals[STR_VALS_DESCRIPTION_COL] = (char*) VAL_STRING(ROW_VALUES(row) + 6);
+		LM_DBG("description: %s\n", str_vals[STR_VALS_DESCRIPTION_COL]);
+
+		/* add info to backing list */
+		if (add_node_info(&cl_list, int_vals, str_vals) < 0) {
+			LM_ERR("Unable to add node info to backing list\n");
+			goto error;
 		}
-		if (n == 1)
-			LM_WARN("The server is the only one in the cluster\n");
+	}
 
-		if (DB_CAPABILITY(*dr_dbf, DB_CAP_FETCH)) {
-			if (dr_dbf->fetch_result(db_hdl, &res, no_rows) < 0) {
-				LM_ERR("fetching rows (1)\n");
-				goto error;
-			}
-		} else {
-			break;
-		}
-	} while (RES_ROW_N(res) > 0);
-
-	LM_DBG("%d records found in %.*s\n",
-		n, db_table->len, db_table->s);
+	if (RES_ROW_N(res) == 1)
+		LM_WARN("The node is the only one in the cluster\n");
 
 	dr_dbf->free_result(db_hdl, res);
-	res = 0;
 
-	return data;
+	return cl_list;
+
 error:
 	if (res)
 		dr_dbf->free_result(db_hdl, res);
-	if (data)
-		free_data(data);
-	data = NULL;
-	return 0;
+	if (cl_list)
+		free_info(cl_list);
+	return NULL;
 }
 
-/* deallocates data */
-void free_data(table_entry_t *data)
+void free_info(cluster_info_t *cl_list)
 {
-	table_entry_t *tmp_entry;
-	table_entry_info_t *info;
-	table_entry_info_t *tmp_info;
-	table_entry_value_t *value;
-	table_entry_value_t *tmp_value;
+	cluster_info_t *tmp_cl;
+	node_info_t *info, *tmp_info;
+	struct cluster_mod *cl_m, *tmp_cl_m;
 
-	struct module_timestamp *timestamp;
-	struct module_timestamp *tmp_timestamp;
+	while (cl_list != NULL) {
+		tmp_cl = cl_list;
+		cl_list = cl_list->next;
 
-	while (data != NULL) {
-		tmp_entry = data;
-		data = data->next;
-		info = tmp_entry->info;
+		info = tmp_cl->node_list;
 		while (info != NULL) {
-			value = info->value;
-			while (value != NULL) {
-				if (value->path.s)
-					shm_free(value->path.s);
-				if (value->description.s)
-					shm_free(value->description.s);
-				timestamp = value->in_timestamps;
-				while (timestamp != NULL) {
-					tmp_timestamp = timestamp;
-					timestamp = timestamp->next;
-					shm_free(tmp_timestamp);
-				}
-				tmp_value = value;
-				value = value->next;
-				shm_free(tmp_value);
-			}
+			if (info->url.s)
+				shm_free(info->url.s);
+			if (info->description.s)
+				shm_free(info->description.s);
 			tmp_info = info;
 			info = info->next;
 			shm_free(tmp_info);
 		}
-		shm_free(tmp_entry);
-	}
-}
 
-/* reloads data from the db */
-static int reload_data(void)
-{
-	struct module_list* modules;
-	table_entry_t *new_data;
-	table_entry_t *old_data;
-	table_entry_t *new_head;
-	table_entry_t *old_head;
-	table_entry_info_t *new_info;
-	table_entry_info_t *old_info;
-	table_entry_value_t *new_value;
-	table_entry_value_t *old_value;
-
-	struct module_timestamp *aux;
-
-	new_data = load_info(&dr_dbf, db_hdl, &db_table);
-	if (!new_data) {
-		LM_CRIT("failed to load routing info\n");
-		return -1;
-	}
-
-	lock_start_write(ref_lock);
-
-	/* no more active readers -> do the swapping */
-
-	for (old_head = *tdata; old_head; old_head = old_head->next) {
-		for (new_head = new_data; new_head; new_head = new_head->next) {
-			if (old_head->cluster_id != new_head->cluster_id)
-				continue;
-
-			for (old_info = old_head->info; old_info; old_info = old_info->next) {
-				for (new_info = new_head->info; new_info; new_info = new_info->next) {
-					if (old_info->proto != new_info->proto)
-						continue;
-
-					for (old_value = old_info->value; old_value; old_value = old_value->next) {
-						for (new_value = new_info->value; new_value; new_value = new_value->next) {
-							if (su_cmp(&new_value->addr, &old_value->addr)) {
-								aux = new_value->in_timestamps;
-								new_value->in_timestamps = old_value->in_timestamps;
-								old_value->in_timestamps = aux;
-								break;
-							}
-						}
-					}
-				}
-			}
+		cl_m = tmp_cl->modules;
+		while (cl_m != NULL) {
+			tmp_cl_m = cl_m;
+			cl_m = cl_m->next;
+			shm_free(tmp_cl_m);
 		}
+
+		shm_free(tmp_cl);
 	}
-
-	old_data = *tdata;
-	*tdata = new_data;
-
-	for (modules = clusterer_modules; modules; modules = modules->next)
-		modules->values = clusterer_find_nodes(modules->accept_cluster_id, modules->proto);
-
-	lock_stop_write(ref_lock);
-
-	/* free old data */
-	if (old_data)
-		free_data(old_data);
-
-	return 0;
 }
 
-/* destroy function */
 static void destroy(void)
 {
-	struct module_list *tmp;
+	struct mod_registration *tmp;
 
 	/* close DB connection */
 	if (db_hdl) {
@@ -1231,16 +845,16 @@ static void destroy(void)
 	}
 
 	/* destroy data */
-	if (tdata) {
-		if (*tdata)
-			free_data(*tdata);
-		shm_free(tdata);
-		tdata = NULL;
+	if (cluster_list) {
+		if (*cluster_list)
+			free_info(*cluster_list);
+		shm_free(cluster_list);
+		cluster_list = NULL;
 	}
 
-	while (clusterer_modules) {
-		tmp = clusterer_modules;
-		clusterer_modules = clusterer_modules->next;
+	while (clusterer_reg_modules) {
+		tmp = clusterer_reg_modules;
+		clusterer_reg_modules = clusterer_reg_modules->next;
 		shm_free(tmp);
 	}
 
@@ -1251,198 +865,112 @@ static void destroy(void)
 	}
 }
 
-/* reloads data from the db */
 static struct mi_root* clusterer_reload(struct mi_root* root, void *param)
 {
+	cluster_info_t *new_info;
+	cluster_info_t *old_info;
+
 	LM_INFO("reload data MI command received!\n");
 
-	/* first if in persistent mode we synchronize data */
-	if (persistent_state)
-		update_db_handler(0, NULL);
-
-	if (reload_data() < 0) {
-		LM_CRIT("failed to load routing data\n");
+	new_info = load_db_info(&dr_dbf, db_hdl, &db_table);
+	if (!new_info) {
+		LM_ERR("Failed to load info from DB\n");
 		return init_mi_tree(500, "Failed to reload", 16);
 	}
+
+	lock_start_write(ref_lock);
+	old_info = *cluster_list;
+	*cluster_list = new_info;
+	lock_stop_write(ref_lock);
+
+	if (old_info)
+		free_info(old_info);
 
 	return init_mi_tree(200, MI_SSTR(MI_OK));
 }
 
-static void temp_disable_machine(table_entry_value_t *head)
+static int set_state(int cluster_id, int node_id, enum cl_node_state state)
 {
-	head->dirty_bit = 1;
-	head->no_tries++;
-	head->last_attempt = time(0);
-	if (head->no_tries == head->failed_attempts) {
-		head->state = CLUSTERER_STATE_OFF;
-	}
-}
+	cluster_info_t *cluster = NULL;
+	node_info_t *node;
 
-static struct module_timestamp* create_module_timestamp(int ctime,
-		struct module_list *module)
-{
-	struct module_timestamp *new_node;
-
-	new_node = shm_malloc(sizeof *new_node);
-	if (!new_node) {
-		LM_ERR("not enough shm memory");
-		goto error;
-	}
-	new_node->state = CLUSTERER_STATE_PROBE;
-	new_node->timestamp = ctime;
-	new_node->up = module;
-	new_node->next = NULL;
-	return new_node;
-
-error:
-	return NULL;
-}
-
-static int set_in_timestamp(struct module_list *module, int machine_id)
-{
-	table_entry_value_t *values;
-	int is_ok = 1;
-	uint64_t ctime = time(0);
-	struct module_timestamp *head;
-
-	LM_DBG("setting timestamp for node with c_id %d m_id %d proto%d\n",
-			module->accept_cluster_id, machine_id, module->proto);
-
-	/* finding the machine */
 	lock_start_write(ref_lock);
 
-	/* if the protocol is not specified */
-	for (values = module->values; values; values = values->next) {
-		if (values->machine_id == machine_id) {
-			is_ok = 0;
-			for (head = values->in_timestamps; head; head = head->next) {
-				if (head->up == module) {
-					if (head->state == CLUSTERER_STATE_OFF) {
-						LM_DBG("state for node with clusterer_id %d is 2\n",
-								values->id);
-						is_ok = -1;
-					} else
-						head->timestamp = ctime;
-
-					break;
-				}
-			}
-
-			break;
+	if (node_id == current_id) {
+		for (cluster = *cluster_list; cluster; cluster = cluster->next)
+			if (cluster->cluster_id == cluster_id)
+				break;
+		if (!cluster) {
+			lock_stop_write(ref_lock);
+			LM_ERR("Cluster id %d not found\n", cluster_id);
+			return -1;
 		}
+
+		cluster->current_node->enabled = state;
+
+		lock_stop_write(ref_lock);
+
+		LM_DBG("Set state: %s for node id: %d from cluster id: %d\n",
+			state ? "enabled" : "disabled", node_id, cluster_id);
+		return 0;
 	}
 
-	lock_stop_write(ref_lock);
-	return is_ok;
-}
-
-/* setting a connection status */
-static int set_state(int cluster_id, int machine_id,
-					 enum cl_machine_state state, int proto)
-{
-	table_entry_value_t *head_table;
-	int is_ok = 1;
-
-	LM_DBG("setting node with c_id %d m_id %d proto %d with state %d\n",
-			cluster_id, machine_id, proto, state);
-
-	/* finding the machine */
-	lock_start_write(ref_lock);
-
-	head_table = clusterer_find_nodes(cluster_id, proto);
-
-	/* if the protocol is not specified */
-	for (; head_table; head_table = head_table->next) {
-		if (head_table->machine_id == machine_id) {
-			head_table->dirty_bit = 1;
-			if (state == CLUSTERER_STATE_OFF) {
-				head_table->no_tries++;
-				head_table->last_attempt = time(0);
-				if (head_table->no_tries == head_table->failed_attempts) {
-					head_table->state = CLUSTERER_STATE_OFF;
-				}
-			} else {
-				head_table->state = state;
-			}
-			is_ok = 0;
+	node = clusterer_find_nodes(cluster_id);
+	for (; node; node = node->next)
+		if (node->node_id == node_id)
 			break;
-		}
+
+	if (!node) {
+		lock_stop_write(ref_lock);
+		LM_ERR("Node id: %d not found in cluster\n", node_id);
+		return -2;
 	}
 
+	if (state == STATE_ENABLED && !node->enabled)
+		node->link_state = LS_RESTART_PINGING;
+
+	node->enabled = state;
+
 	lock_stop_write(ref_lock);
-	return is_ok;
+
+	LM_DBG("Set state: %s for node id: %d from cluster id: %d\n",
+			state ? "enabled" : "disabled", node_id, cluster_id);
+	return 0;
 }
 
-/* setting a connection status command function*/
 static struct mi_root* clusterer_set_status(struct mi_root *cmd, void *param)
 {
 	unsigned int cluster_id;
-	unsigned int machine_id;
+	unsigned int node_id;
 	unsigned int state;
-	int proto;
 	int rc;
 	struct mi_node *node;
-	struct mi_node *prot_node;
 
 	LM_INFO("set status MI command received!\n");
 
-	if (!cmd || !cmd->node.kids || !cmd->node.kids->value.s) {
-		LM_DBG("no values specified\n");
-		return init_mi_tree(400, MI_SSTR(MI_MISSING_PARM));
-	}
-
 	node = cmd->node.kids;
 
-	if (!node->next || !node->next->value.s) {
-		LM_DBG("only one value specified\n");
-		return init_mi_tree(400, MI_SSTR(MI_MISSING_PARM));
-	}
-
-	if (!node->next->next || !node->next->next->value.s) {
-		LM_DBG("no state specified\n");
-		return init_mi_tree(400, MI_SSTR(MI_MISSING_PARM));
-	}
+	if (node == NULL || node->next == NULL || node->next->next==NULL ||
+		node->next->next->next != NULL)
+		return init_mi_tree(400, MI_MISSING_PARM_S, MI_MISSING_PARM_LEN);
 
 	rc = str2int(&node->value, &cluster_id);
-
-	if (rc == -1 || cluster_id == 0) {
-		LM_DBG("the cluster_id parameter is not a valid digit\n");
+	if (rc < 0 || cluster_id < 1)
 		return init_mi_tree(400, MI_SSTR(MI_BAD_PARM));
-	}
 
-	rc = str2int(&node->next->value, &machine_id);
-	if (rc == -1 || machine_id == 0) {
-		LM_DBG("the machine_id parameter is not a valid digit\n");
+	rc = str2int(&node->next->value, &node_id);
+	if (rc < 0 || node_id < 1)
 		return init_mi_tree(400, MI_SSTR(MI_BAD_PARM));
-	}
 
 	rc = str2int(&node->next->next->value, &state);
-	if (rc == -1 || (state != CLUSTERER_STATE_ON && state != CLUSTERER_STATE_PROBE)) {
-		LM_DBG("the state parameter is not valid\n");
+	if (rc < 0 || (state != STATE_DISABLED && state != STATE_ENABLED))
 		return init_mi_tree(400, MI_SSTR(MI_BAD_PARM));
-	}
 
-	prot_node = node->next->next->next;
-	if (!prot_node || !prot_node->value.s) {
-		LM_DBG("the protocol parameter is missing\n");
-		return init_mi_tree(400, MI_SSTR(MI_BAD_PARM));
-	}
-
-	if (parse_proto((unsigned char*) prot_node->value.s, prot_node->value.len, &proto) < 0) {
-		LM_DBG("the protocol parameter is not valid\n");
-		return init_mi_tree(400, MI_SSTR(MI_BAD_PARM));
-	}
-
-	rc = set_state(cluster_id, machine_id, state, proto);
-
-	if (rc == -1) {
-		LM_DBG("cluster id or machine id are not smaller than 1\n");
-		return init_mi_tree(400, MI_SSTR(MI_BAD_PARM));
-	}
-
-	if (rc == 1) {
-		LM_DBG("there is no machine id %d in the cluster %d\n", machine_id, cluster_id);
-	}
+	rc = set_state(cluster_id, node_id, (int)state);
+	if (rc == -1)
+		return init_mi_tree(404, "Cluster id not found", 20);
+	if (rc == 1)
+		return init_mi_tree(404, "Node id not found", 17);
 
 	return init_mi_tree(200, MI_SSTR(MI_OK));
 }
@@ -1450,87 +978,66 @@ static struct mi_root* clusterer_set_status(struct mi_root *cmd, void *param)
 /* lists all valid connections */
 static struct mi_root * clusterer_list(struct mi_root *cmd_tree, void *param)
 {
-	table_entry_t *head_table;
-	table_entry_info_t *info;
-	table_entry_value_t *value;
-	struct mi_node *root = NULL;
+	cluster_info_t *cl;
+	node_info_t *n_info;
 	struct mi_root *rpl_tree = NULL;
 	struct mi_node *node = NULL;
+	struct mi_node *node_s = NULL;
 	struct mi_attr* attr;
-	str cluster_id;
-	str clusterer_id;
-	str machine_id;
-	str state;
-	str no_tries;
-	str duration;
-	str last_attempt;
-	str failed_attempts;
+	str val;
 
 	rpl_tree = init_mi_tree(200, MI_OK_S, MI_OK_LEN);
 	if (!rpl_tree)
 		return NULL;
+	rpl_tree->node.flags |= MI_IS_ARRAY;
 
 	lock_start_read(ref_lock);
 
-	head_table = *tdata;
-	root = &rpl_tree->node;
-	for (head_table = *tdata; head_table; head_table = head_table->next) {
-		for (info = head_table->info; info; info = info->next) {
-			for (value = info->value; value; value = value->next) {
-				clusterer_id.s = int2str(value->id, &clusterer_id.len);
-				node = add_mi_node_child(root, MI_DUP_VALUE, "Clusterer ID", 12,
-					clusterer_id.s, clusterer_id.len);
-				if (!node) goto error;
+	/* iterate through clusters */
+	for (cl = *cluster_list; cl; cl = cl->next) {
 
-				cluster_id.s = int2str(head_table->cluster_id, &cluster_id.len);
-				attr = add_mi_attr(node, MI_DUP_VALUE, "Cluster ID", 10,
-					cluster_id.s, cluster_id.len);
-				if (!attr) goto error;
+		val.s = int2str(cl->cluster_id, &val.len);
+		node = add_mi_node_child(&rpl_tree->node, MI_DUP_VALUE|MI_IS_ARRAY,
+			MI_SSTR("Cluster"), val.s, val.len);
+		if (!node) goto error;
 
-				machine_id.s = int2str(value->machine_id, &machine_id.len);
-				attr = add_mi_attr(node, MI_DUP_VALUE, "Machine ID", 10,
-					machine_id.s, machine_id.len);
-				if (!attr) goto error;
+		/* iterate through servers */
+		for (n_info = cl->node_list; n_info; n_info = n_info->next) {
 
-				state.s = int2str(value->state, &state.len);
-				attr = add_mi_attr(node, MI_DUP_VALUE, "STATE", 5,
-					state.s, state.len);
-				if (!attr) goto error;
+			val.s = int2str(n_info->node_id, &val.len);
+			node_s = add_mi_node_child(node, MI_DUP_VALUE,
+				MI_SSTR("Server"), val.s, val.len);
+			if (!node) goto error;
 
-				last_attempt.s = int2str(value->last_attempt, &last_attempt.len);
-				attr = add_mi_attr(node, MI_DUP_VALUE, "LAST_FAILED_ATTEMPT", 19,
-					last_attempt.s, last_attempt.len);
-				if (!attr) goto error;
+			val.s = int2str(n_info->id, &val.len);
+			attr = add_mi_attr(node_s, MI_DUP_VALUE,
+				MI_SSTR("DB_ID"), val.s, val.len);
+			if (!attr) goto error;
 
-				failed_attempts.s = int2str(value->failed_attempts, &failed_attempts.len);
-				attr = add_mi_attr(node, MI_DUP_VALUE, "MAX_FAILED_ATTEMPTS", 19,
-					failed_attempts.s, failed_attempts.len);
-				if (!attr) goto error;
+			attr = add_mi_attr(node_s, MI_DUP_VALUE,
+				MI_SSTR("URL"), n_info->url.s, n_info->url.len);
+			if (!attr) goto error;
 
-				no_tries.s = int2str(value->no_tries, &no_tries.len);
-				attr = add_mi_attr(node, MI_DUP_VALUE, "NO_TRIES", 8,
-					no_tries.s, no_tries.len);
-				if (!attr) goto error;
+			val.s = int2str(n_info->enabled, &val.len);
+			attr = add_mi_attr(node_s, MI_DUP_VALUE,
+				MI_SSTR("State"), val.s, val.len);
+			if (!attr) goto error;
 
-				duration.s = int2str(value->duration, &duration.len);
-				attr = add_mi_attr(node, MI_DUP_VALUE, "SECONDS_UNTIL_ENABLING", 22,
-					duration.s, duration.len);
-				if (!attr) goto error;
+			val.s = int2str(n_info->no_ping_retries, &val.len);
+			attr = add_mi_attr(node_s, MI_DUP_VALUE,
+				MI_SSTR("No_ping_retries"), val.s, val.len);
+			if (!attr) goto error;
 
-				attr = add_mi_attr(node, MI_DUP_VALUE, "PATH", 4,
-					value->path.s, value->path.len);
-				if (!attr) goto error;
-
-				if (value->description.s)
-					attr = add_mi_attr(node, MI_DUP_VALUE, "DESCRIPTION", 11,
-					value->description.s, value->description.len);
-				else
-					attr = add_mi_attr(node, MI_DUP_VALUE, "DESCRIPTION", 11,
+			if (n_info->description.s)
+				attr = add_mi_attr(node_s, MI_DUP_VALUE,
+					MI_SSTR("Description"),
+					n_info->description.s, n_info->description.len);
+			else
+				attr = add_mi_attr(node_s, MI_DUP_VALUE,
+					MI_SSTR("Description"),
 					"none", 4);
-				if (!attr) goto error;
-			}
+			if (!attr) goto error;
 		}
-
 	}
 
 	lock_stop_read(ref_lock);
@@ -1542,20 +1049,16 @@ error:
 	return NULL;
 }
 
-static void free_node(clusterer_node_t *node)
+static void free_clusterer_node(clusterer_node_t *node)
 {
-	if (node) {
-		if (node->description.s)
-			pkg_free(node->description.s);
-		pkg_free(node);
-	}
-
+	if (node->description.s)
+		pkg_free(node->description.s);
+	pkg_free(node);
 }
 
-static int add_node(clusterer_node_t **nodes, table_entry_value_t *head, int proto)
+static int add_clusterer_node(clusterer_node_t **cl_node_list, node_info_t *n_info)
 {
 	clusterer_node_t *new_node = NULL;
-	struct ip_addr ip;
 
 	new_node = pkg_malloc(sizeof *new_node);
 	if (!new_node) {
@@ -1563,201 +1066,259 @@ static int add_node(clusterer_node_t **nodes, table_entry_value_t *head, int pro
 		goto error;
 	}
 
-	new_node->next = NULL;
-	new_node->description.s = NULL;
-	new_node->machine_id = head->machine_id;
-	new_node->state = head->state;
-	new_node->proto = proto;
+	new_node->node_id = n_info->node_id;
+	new_node->proto = n_info->proto;
 
-	memcpy(&new_node->addr, &head->addr, sizeof(head->addr));
-	new_node->description.s = pkg_malloc(head->description.len * sizeof(char));
+	new_node->description.s = pkg_malloc(n_info->description.len * sizeof(char));
 	if (!new_node->description.s) {
 		LM_ERR("no more pkg memory\n");
 		goto error;
 	}
+	new_node->description.len = n_info->description.len;
+	memcpy(new_node->description.s, n_info->description.s, n_info->description.len);
 
-	memcpy(new_node->description.s, head->description.s, head->description.len);
+	memcpy(&new_node->addr, &n_info->addr, sizeof(n_info->addr));
+	new_node->next = NULL;
 
-	su2ip_addr(&ip, &new_node->addr);
-	new_node->description.len = head->description.len;
-	if (*nodes)
-		new_node->next = *nodes;
+	if (*cl_node_list)
+		new_node->next = *cl_node_list;
 
-	*nodes = new_node;
+	*cl_node_list = new_node;
 	return 0;
 error:
-	free_node(new_node);
+	if (new_node)
+		free_clusterer_node(new_node);
 	return -1;
 }
 
-static void free_nodes(clusterer_node_t *nodes)
+static void free_clusterer_nodes(clusterer_node_t *nodes)
 {
 	clusterer_node_t *tmp;
 
 	while (nodes) {
 		tmp = nodes;
 		nodes = nodes->next;
-		free_node(tmp);
+		free_clusterer_node(tmp);
 	}
 }
 
-static clusterer_node_t* get_nodes(int cluster_id, int proto)
+static clusterer_node_t* get_clusterer_nodes(int cluster_id)
 {
-	clusterer_node_t *tmp, *ret_nodes = NULL;
-	table_entry_value_t *node;
+	clusterer_node_t *ret_nodes = NULL;
+	node_info_t *node;
 
 	lock_start_read(ref_lock);
 
-	for (node = clusterer_find_nodes(cluster_id, proto); node; node = node->next)
-		if (node->link_state == LS_UP && add_node(&ret_nodes, node, proto) < 0) {
-			lock_stop_read(ref_lock);
-
-			while (ret_nodes) {
-				tmp = ret_nodes;
-				ret_nodes = ret_nodes->next;
-				free_node(tmp);
+	for (node = clusterer_find_nodes(cluster_id); node; node = node->next)
+		if (node->enabled && node->link_state == LS_UP)
+			if (add_clusterer_node(&ret_nodes, node) < 0) {
+				lock_stop_read(ref_lock);
+				LM_ERR("Unable to add node with id %d to the returned list of reachable nodes\n",
+					node->node_id);
+				free_clusterer_nodes(ret_nodes);
+				return NULL;
 			}
-
-			return NULL;
-		}
 
 	lock_stop_read(ref_lock);
 
 	return ret_nodes;
 }
 
-int clusterer_check(int cluster_id, union sockaddr_union* su, int machine_id, int proto)
+static int get_my_id(void)
 {
-	int rc = 0;
-	table_entry_value_t *head;
+	return current_id;
+}
+
+static node_info_t *clusterer_find_nodes(int cluster_id)
+{
+	cluster_info_t *cl;
+	node_info_t *n = NULL;
+
+	cl = *cluster_list;
+	while (cl && cl->cluster_id != cluster_id)
+		cl = cl->next;
+
+	if (cl)
+		n = cl->node_list;
+
+	return n;
+}
+
+/* called with lock acquired for reading
+ * @return:
+ *  0 : success, message sent
+ *  1 : disabled, message not sent
+ * -2 : unsupported protocol
+ * -3 : error sending
+ * -4 : down or probing
+ */
+static int clusterer_send_msg(node_info_t *node) {
+	str send_buffer;
+
+	if (!node->enabled)
+		return 1;
+
+	if (node->proto != PROTO_BIN) {
+		LM_WARN("Cannot send message to node %d, clusterer currently supports only BIN protocol\n",
+			node->node_id);
+		return -1;
+	}
+
+	if (node->link_state == LS_UP) {
+		bin_get_buffer(&send_buffer);
+
+		if (msg_send(NULL, node->proto, &node->addr, 0,
+				send_buffer.s, send_buffer.len, 0) < 0) {
+			lock_stop_read(ref_lock);
+
+			lock_start_write(ref_lock);
+			node->link_state = LS_RESTART_PINGING;
+			lock_stop_write(ref_lock);
+
+			lock_start_read(ref_lock);
+
+			LM_ERR("Failed to send message to node %d\n", node->node_id);
+			return -2;
+		}
+	} else {
+		LM_WARN("Node %d is down or probing, cannot send message\n", node->node_id);
+		return -3;
+	}
+
+	return 0;
+}
+
+/* @return:
+ *  0 : success
+ *  1 : node is disabled
+ *  2 : current node is disabled
+ * -1 : node not found in cluster
+ * -2 : node has unsupported protocol
+ * -3 : error sending
+ * -4 : node is down or probing
+ * -5 : cluster not found
+ */
+static int send_to(int cluster_id, int node_id)
+{
+	node_info_t *node;
+	int rc;
+	cluster_info_t *cl;
 
 	lock_start_read(ref_lock);
 
-	head = clusterer_find_nodes(cluster_id, proto);
-	for (; head; head = head->next) {
-		if (su_ip_cmp(su, &head->addr) && head->machine_id == machine_id) {
-			rc = 1;
+	for (cl = *cluster_list; cl; cl = cl->next)
+		if (cl->cluster_id == cluster_id)
 			break;
+	if (cl) {
+		if (!cl->current_node->enabled) {
+			lock_stop_read(ref_lock);
+			return 2;
 		}
+		node = cl->node_list;
+	} else {
+		LM_WARN("Unknown cluster, id: %d\n", cluster_id);
+		lock_stop_read(ref_lock);
+		return -5;
 	}
+
+	for (; node; node = node->next)
+		if (node->node_id == node_id)
+			break;
+
+	if (!node) {
+		LM_ERR("Node id: %d not found in cluster\n", node_id);
+		lock_stop_read(ref_lock);
+		return -1;
+	}
+
+	rc = clusterer_send_msg(node);
 
 	lock_stop_read(ref_lock);
 
 	return rc;
 }
 
-static int get_my_id(void)
+static int send_all(int cluster_id)
 {
-	return server_id;
-}
-
-static table_entry_value_t *clusterer_find_nodes(int cluster_id, int proto)
-{
-	table_entry_t *head;
-	table_entry_info_t *info = NULL;
-	table_entry_value_t *value = NULL;
-
-	head = *tdata;
-	while (head && head->cluster_id != cluster_id)
-		head = head->next;
-
-	if (head) {
-		info = head->info;
-		while (info && info->proto != proto)
-			info = info->next;
-
-		if (info)
-			value = info->value;
-	}
-
-	return value;
-}
-
-static int send_to(int cluster_id, int proto)
-{
-	table_entry_value_t *value;
-	str send_buffer;
-	unsigned long ctime = time(0);
-	int ok = -1;
-
-	if (proto == PROTO_BIN)
-		bin_get_buffer(&send_buffer);
+	node_info_t *node;
+	int rc = -1;
+	cluster_info_t *cl;
 
 	lock_start_read(ref_lock);
 
-	value = clusterer_find_nodes(cluster_id, proto);
-	for (; value; value = value->next) {
-		ok = 0;
-		if (value->state == 1) {
-			if (value->prev_no_tries != -1 &&
-				value->no_tries > 0 &&
-				value->prev_no_tries == value->no_tries) {
-				value->no_tries = 0;
-			}
-			value->prev_no_tries = value->no_tries;
+	for (cl = *cluster_list; cl; cl = cl->next)
+		if (cl->cluster_id == cluster_id)
+			break;
+	if (cl) {
+		if (!cl->current_node->enabled) {
+			lock_stop_read(ref_lock);
+			return rc;
 		}
-
-		if (value->state == 2) {
-			if ((ctime - value->last_attempt) >= value->duration) {
-				value->last_attempt = ctime;
-				value->state = 1;
-				value->no_tries = 0;
-			}
-		}
-
-		if (value->state == 1) {
-			if (proto == PROTO_BIN) {
-				if (msg_send(NULL, PROTO_BIN, &value->addr, 0,
-				             send_buffer.s, send_buffer.len, 0) != 0) {
-					LM_ERR("cannot send message\n");
-					temp_disable_machine(value);
-				}
-			}
-		}
+		node = cl->node_list;
+	} else {
+		LM_WARN("Unknown cluster, id: %d\n", cluster_id);
+		lock_stop_read(ref_lock);
+		return rc;
 	}
+
+	for (; node; node = node->next)
+		if (clusterer_send_msg(node) == 0)
+			rc = 0;
 
 	lock_stop_read(ref_lock);
 
-	return ok;
+	return rc;
 }
 
-static table_entry_value_t *find_node_by_id(int machine_id, int proto) {
-	table_entry_t *clusters_it;
-	table_entry_info_t *protos_it;
-	table_entry_value_t *node;
-
-	for (clusters_it = *tdata; clusters_it; clusters_it=clusters_it->next)
-		for (protos_it = clusters_it->info; protos_it; protos_it=protos_it->next) {
-			if (protos_it->proto != proto)
-				continue;
-			for (node = protos_it->value; node; node=node->next)
-				if (node->machine_id == machine_id)
-					return node;
-		}
-	return NULL;
-}
-
-static void receive_clusterer_bin_packets(int packet_type, struct receive_info *ri, void *att) {
-	int source_id;
+static void receive_clusterer_bin_packets(int packet_type, struct receive_info *ri,
+											void *att)
+{
+	int source_id, cl_id;
 	struct timeval now;
-	table_entry_value_t *node;
+	node_info_t *node = NULL;
+	cluster_info_t *cl;
 
 	gettimeofday(&now, NULL);
 
-	if (bin_pop_int(&source_id)) {
-		LM_ERR("Failed to get source id of ping\n");
+	if (bin_pop_int(&cl_id)) {
+		LM_ERR("Failed to get source cluster id of ping\n");
 		return;
 	}
 
-	node = find_node_by_id(source_id, PROTO_BIN);
+	if (bin_pop_int(&source_id)) {
+		LM_ERR("Failed to get source node id of ping\n");
+		return;
+	}
+
+	lock_start_write(ref_lock);
+
+	for (cl = *cluster_list; cl; cl = cl->next)
+		if (cl->cluster_id == cl_id)
+			break;
+	if (cl) {
+		if (!cl->current_node->enabled) {
+			lock_stop_write(ref_lock);
+			return;
+		}
+		node = cl->node_list;
+	} else {
+		LM_WARN("Received message from unknown cluster, id: %d\n", cl_id);
+		lock_stop_write(ref_lock);
+		return;
+	}
+
+	for (; node; node = node->next)
+		if (node->node_id == source_id)
+			break;
+
+	if (!node) {
+		LM_WARN("Received clusterer message from unknown source, id: %d\n", source_id);
+		lock_stop_write(ref_lock);
+		return;
+	}
 
 	switch (packet_type) {
 	case CLUSTERER_PONG:
-		if (!node) {
-			LM_WARN("Received pong from unknown source, id: %d\n", source_id);
-			return;
-		}
-
 		LM_DBG("Received pong from node %d\n", source_id);
 		node->last_pong = now;
 
@@ -1768,83 +1329,96 @@ static void receive_clusterer_bin_packets(int packet_type, struct receive_info *
 
 		break;
 	case CLUSTERER_PING:
-		if (!node) {
-			LM_WARN("Received ping from unknown source, id: %d\n", source_id);
-			return;
-		}
-
 		/* reply with pong */
-		if (send_heartbeat_msg(&node->addr, CLUSTERER_PONG) < 0) {
+		if (send_heartbeat_msg(cl_id, &node->addr, CLUSTERER_PONG) < 0) {
 			LM_ERR("Failed to reply to ping from node %d\n", source_id);
-		} else {
+			if (node->link_state == LS_UP)
+				node->link_state = LS_RESTART_PINGING;
+		} else
 			LM_DBG("Replied to ping from node %d\n", source_id);
-		}
 
 		/* if the node was down, restart pinging */
 		if (node->link_state == LS_DOWN) {
 			LM_INFO("Received ping from failed node, restart pinging");
-			node->link_state = LS_RETRY_DOWN_START;
+			node->link_state = LS_RESTART_PINGING;
 		}
 
 		break;
 	default:
 		LM_WARN("Invalid clusterer binary packet command from node: %d\n", source_id);
 	}
+
+	lock_stop_write(ref_lock);
 }
 
 static void bin_receive_packets(int packet_type, struct receive_info *ri, void *ptr)
 {
-	struct module_list *module;
+	struct mod_registration *module;
 	unsigned short port;
-	int machine_id;
+	int source_id;
 	char *ip;
-	int rc;
-
-	rc = bin_pop_int(&machine_id);
-	if (rc < 0)
-		return;
+	node_info_t *node = NULL;
+	cluster_info_t *cl;
 
 	get_su_info(&ri->src_su.s, ip, port);
-	LM_DBG("received bin packet from source: %s:%hu\n",
-		ip, port);
+	LM_DBG("received bin packet from source: %s:%hu\n", ip, port);
 
-	module = (struct module_list *) ptr;
+	if (bin_pop_int(&source_id)) {
+		LM_ERR("Failed to pop the source node id from binary packet\n");
+		return;
+	}
+
+	module = (struct mod_registration *)ptr;
+
+	lock_start_write(ref_lock);
+
+	for (cl = *cluster_list; cl; cl = cl->next)
+		if (cl->cluster_id == module->accept_cluster_id)
+			break;
+	if (cl) {
+		if (!cl->current_node->enabled)
+			return;
+		node = cl->node_list;
+	} else {
+		LM_WARN("Received message from unknown cluster, id: %d\n", module->accept_cluster_id);
+		return;
+	}
 
 	if (module->auth_check) {
-		if (!clusterer_check(module->accept_cluster_id, &ri->src_su, machine_id, ri->proto)) {
-			get_su_info(&ri->src_su.s, ip, port);
-			LM_WARN("received bin packet from unknown source: %s:%hu\n",
-				ip, port);
+		for (; node; node = node->next)
+			if (node->node_id == source_id)
+				break;
+
+		if (!node) {
+			LM_WARN("Received message from unknown source, id: %d\n", source_id);
 			return;
+		}
+
+		/* if the node was down, restart pinging */
+		if (node->link_state == LS_DOWN) {
+			LM_INFO("Received message from failed node, restart pinging");
+			node->link_state = LS_RESTART_PINGING;
 		}
 	}
 
-	rc = set_in_timestamp(module, machine_id);
+	lock_stop_write(ref_lock);
 
-	if (rc < 0) {
-		module->cb(SERVER_TEMP_DISABLED, ri, machine_id);
-		return;
-	}
-
-	module->cb(packet_type, ri, machine_id);
+	module->cb(packet_type, ri, source_id);
 }
 
-static int cl_register_module(char *mod_name, int proto,
-				void (*cb)(int, struct receive_info *, int),
-				int timeout, int auth_check, int accept_cluster_id)
+static int cl_register_module(char *mod_name, int proto, clusterer_cb_f cb,
+								int auth_check, int accept_cluster_id)
 {
-	struct module_list *new_module;
+	struct mod_registration *new_module;
 
-	LM_DBG("register module %s\n", mod_name);
-
-	if (auth_check && !accept_cluster_id) {
-		LM_ERR("provided bad cluster_id\n");
+	if (accept_cluster_id < 1) {
+		LM_ERR("Bad cluster_id\n");
 		return -1;
 	}
 
 	new_module = shm_malloc(sizeof *new_module);
 	if (!new_module) {
-		LM_ERR("insufficient shm memory\n");
+		LM_ERR("No more shm memory\n");
 		return -1;
 	}
 
@@ -1852,39 +1426,37 @@ static int cl_register_module(char *mod_name, int proto,
 	new_module->mod_name.s = mod_name;
 	new_module->proto = proto;
 	new_module->cb = cb;
-	new_module->timeout = timeout;
 	new_module->auth_check = auth_check;
 	new_module->accept_cluster_id = accept_cluster_id;
-	new_module->duration = 2 * timeout;
-	new_module->next = NULL;
 
 	switch (proto) {
 	case PROTO_BIN:
 		bin_register_cb(mod_name, bin_receive_packets, new_module);
 		break;
 	default:
-		LM_ERR("unidentified protocol\n");
+		LM_DBG("Clusterer currently supports only BIN protocol\n");
 		shm_free(new_module);
 		return -1;
 	}
 
-	new_module->values = NULL;
-	new_module->next = clusterer_modules;
-	clusterer_modules = new_module;
+	new_module->next = clusterer_reg_modules;
+	clusterer_reg_modules = new_module;
+
+	LM_DBG("Registered module %s\n", mod_name);
 
 	return 0;
 }
 
 int load_clusterer(struct clusterer_binds *binds)
 {
-	binds->get_nodes = get_nodes;
+	binds->get_nodes = get_clusterer_nodes;
 	binds->set_state = set_state;
-	binds->free_nodes = free_nodes;
-	binds->check = clusterer_check;
+	binds->free_nodes = free_clusterer_nodes;
 	binds->get_my_id = get_my_id;
 	binds->send_to = send_to;
+	binds->send_all = send_all;
 	binds->register_module = cl_register_module;
 
-	/* everything ok*/
 	return 1;
 }
+

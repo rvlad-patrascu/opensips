@@ -4,34 +4,28 @@
 #include "../../str.h"
 #include "api.h"
 
-#define INT_VALS_CLUSTER_ID_COL     0
-#define INT_VALS_MACHINE_ID_COL     1
-#define INT_VALS_STATE_COL          2
-#define STR_VALS_DESCRIPTION_COL    0
-#define STR_VALS_URL_COL            1
-#define INT_VALS_CLUSTERER_ID_COL   3
-#define INT_VALS_FAILED_ATTEMPTS_COL    4
-#define INT_VALS_NO_TRIES_COL           5
-#define INT_VALS_DURATION_COL           6
-
 #define BIN_VERSION 1
 
 #define DEFAULT_PING_INTERVAL 4
 #define DEFAULT_NODE_TIMEOUT 60
 #define DEFAULT_PING_TIMEOUT 1000 /* in milliseconds */
-#define DEFAULT_PING_RETRIES 2
 
-extern str clusterer_db_url;
-extern str db_table;
-extern str cluster_id_col;
-extern str machine_id_col;
-extern int server_id;
-extern int persistent_state;
-extern str id_col;
-extern str last_attempt_col;
-extern str duration_col;
-extern str failed_attempts_col;
-extern str no_tries_col;
+#define NO_DB_INT_VALS 5
+#define NO_DB_STR_VALS 2
+#define NO_DB_COLS 7
+
+enum db_int_vals_idx {
+    INT_VALS_ID_COL,
+    INT_VALS_CLUSTER_ID_COL,
+    INT_VALS_NODE_ID_COL,
+    INT_VALS_STATE_COL,
+    INT_VALS_NO_PING_RETRIES_COL
+};
+
+enum db_str_vals_idx {
+    STR_VALS_URL_COL,
+    STR_VALS_DESCRIPTION_COL
+};
 
 typedef enum {
     CLUSTERER_PING,
@@ -41,95 +35,52 @@ typedef enum {
 typedef enum {
     LS_UP,
     LS_DOWN,
-    /* probing states */
     LS_RETRY_SEND_FAIL,
-    LS_RETRY_NODE_TIMEOUT,
-    LS_RETRY_DOWN_START,
-    LS_RETRY_DOWN,
-    LS_RETRYING
+    LS_RESTART_PINGING,
+    LS_RESTARTED,
+    LS_RETRYING,
 } clusterer_link_state;
 
-typedef struct table_entry_ table_entry_t;
-typedef struct table_entry_info_ table_entry_info_t;
-typedef struct table_entry_value_ table_entry_value_t;
-
-struct module_list{
+struct mod_registration {
    str mod_name;
    int proto;
-   void (*cb)(int, struct receive_info *, int);
-   int timeout;
-   int duration;
+   clusterer_cb_f cb;
    int auth_check;
    int accept_cluster_id;
-   table_entry_value_t *values;
-   struct module_list *next;
+   struct mod_registration *next;
 };
 
-struct module_timestamp{
-    enum cl_machine_state state;
-    uint64_t timestamp;
-    struct module_list *up;
-    struct module_timestamp *next;
+struct cluster_mod {
+    struct mod_registration *reg;
+    struct cluster_mod *next;
 };
 
-struct table_entry_value_{
-    /* machine id */
-    int machine_id;
-    /* cluster id */
-    int id;
-    /* state */
-    int state;
-    /* state of 'link' with this node */
-    clusterer_link_state link_state;
-    /* last pong received from this node*/
-    struct timeval last_pong;
-    /* last ping sent to this node*/
-    struct timeval last_ping;
-    /* number of ping retries */
-    int ping_retries;
-    /* dirty bit */
-    int dirty_bit;
-    /* description string */
+struct cluster_info;
+
+typedef struct node_info {
+    int id;                             /* DB id (PK) */
+    int node_id;
+    int enabled;                        /* node state (enabled/disabled) */
+    clusterer_link_state link_state;    /* state of the "link" with this node */
     str description;
-    /* path */
-    str path;
-    /* timestamp */
-    uint64_t last_attempt;
-    /* duration */
-    int duration;
-    /* previous number of tries */
-    int prev_no_tries;
-    /* no of tries */
-    int no_tries;
-    /* failed attempts */
-    int failed_attempts;
-    /* sock address */   
-    union sockaddr_union addr;
-    /* module list */
-    struct module_timestamp *in_timestamps;
-    /* linker in list */
-    table_entry_value_t *next;
-};
-
-struct table_entry_info_{
-    /* protocol */
+    str url;
     int proto;
-    /* data */
-    table_entry_value_t *value;
-    /* linker in the list */
-    table_entry_info_t *next;
-};
+    union sockaddr_union addr;
+    struct timeval last_pong;       /* last pong received from this node*/
+    struct timeval last_ping;       /* last ping sent to this node*/
+    int no_ping_retries;            /* maximum number of ping retries */
+    int curr_no_retries;
+    struct cluster_info *cluster;   /* containing cluster */
+    struct node_info *next;
+} node_info_t;
 
-
-/* data list */
-struct table_entry_ {
-    /* clusterer_id */
+typedef struct cluster_info {
     int cluster_id;
-    /* entry info */
-    table_entry_info_t *info;
-    /* linker in list */
-    table_entry_t *next;
-};
+    struct cluster_mod *modules;    /* modules registered for this cluster */
+    node_info_t *node_list;
+    node_info_t *current_node;      /* current node's info in this cluster */
+    struct cluster_info *next;
+} cluster_info_t;
 
 #endif	/* CLUSTERER_H */
 
