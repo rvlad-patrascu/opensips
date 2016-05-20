@@ -10,16 +10,20 @@
 #define DEFAULT_NODE_TIMEOUT 60
 #define DEFAULT_PING_TIMEOUT 1000 /* in milliseconds */
 
-#define NO_DB_INT_VALS 5
+#define NO_DB_INT_VALS 6
 #define NO_DB_STR_VALS 2
-#define NO_DB_COLS 7
+#define NO_DB_COLS 8
+
+struct cluster_info;
+struct node_info;
 
 enum db_int_vals_idx {
     INT_VALS_ID_COL,
     INT_VALS_CLUSTER_ID_COL,
     INT_VALS_NODE_ID_COL,
     INT_VALS_STATE_COL,
-    INT_VALS_NO_PING_RETRIES_COL
+    INT_VALS_NO_PING_RETRIES_COL,
+    INT_VALS_PRIORITY_COL
 };
 
 enum db_str_vals_idx {
@@ -55,7 +59,18 @@ struct cluster_mod {
     struct cluster_mod *next;
 };
 
-struct cluster_info;
+/* used for adjacency list */
+struct neighbour {
+    struct node_info *node;
+    struct neighbour *next;
+};
+
+/* entry in queue used for shortest path searching */
+struct node_search_info {
+    struct node_info *node;
+    struct node_search_info *parent;
+    struct node_search_info *next;      /* linker in queue */
+};
 
 typedef struct node_info {
     int id;                             /* DB id (PK) */
@@ -65,12 +80,17 @@ typedef struct node_info {
     str description;
     str url;
     int proto;
+    int priority;                   /* priority to be chosen as next hop for same length paths */
     union sockaddr_union addr;
     struct timeval last_pong;       /* last pong received from this node*/
     struct timeval last_ping;       /* last ping sent to this node*/
     int no_ping_retries;            /* maximum number of ping retries */
     int curr_no_retries;
-    struct cluster_info *cluster;   /* containing cluster */
+    struct cluster_info *cluster;       /* containing cluster */
+    struct neighbour *neighbour_list;   /* list of reachable neighbours */
+    int sp_top_version;                 /* last topology version for which shortest path was computed */
+    struct node_info *next_hop;         /* next hop from the shortest path */
+    struct node_search_info *sp_info;   /* shortest path info, needed ? */
     struct node_info *next;
 } node_info_t;
 
@@ -80,6 +100,7 @@ typedef struct cluster_info {
     node_info_t *node_list;
     node_info_t *current_node;      /* current node's info in this cluster */
     struct cluster_info *next;
+    int top_version;                /* topology version */
 } cluster_info_t;
 
 #endif	/* CLUSTERER_H */

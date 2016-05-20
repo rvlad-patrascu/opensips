@@ -116,7 +116,22 @@ int bin_push_str(const str *info);
  */
 int bin_push_int(int info);
 
-/* TODO - comment, lol */
+/*
+ * removes an interger from the end of the send buffer
+ *
+ * @return:
+ *		0: success
+ *		< 0: error, no more integers in buffer
+ */
+int bin_alter_pop_int(void);
+
+/*
+ * returns the send buffer
+ *
+ * @return:
+ *		0: success
+ *		< 0: error
+ */
 int bin_get_buffer(str *buffer);
 
 /*
@@ -147,6 +162,17 @@ int bin_pop_str(str *info);
  * Note: Information is retrieved in the same order it was stored
  */
 int bin_pop_int(void *info);
+
+/*
+ * pops an integer from the end of a received binary packet
+ * @info:   pointer to store the result
+ *
+ * @return:
+ *		0 (success): info retrieved
+ *		1 (success): nothing returned, all data has been consumed!
+ *		< 0: error
+ */
+int bin_pop_back_int(void *info);
 
 /*
  * skips @count integers from a received binary packet

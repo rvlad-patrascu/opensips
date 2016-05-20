@@ -143,6 +143,30 @@ int bin_push_int(int info)
 	return (int)(cpos - send_buffer);
 }
 
+/*
+ * removes an interger from the end of the send buffer
+ *
+ * @return:
+ *		0: success
+ *		< 0: error, no more integers in buffer
+ */
+int bin_alter_pop_int(void) {
+	if (!cpos || (cpos - sizeof(int)) < send_buffer)
+		return -1;
+
+	cpos -= sizeof(int);
+	set_len(send_buffer, cpos);
+
+	return 0;
+}
+
+/*
+ * returns the send buffer
+ *
+ * @return:
+ *		0: success
+ *		< 0: error
+ */
 int bin_get_buffer(str *buffer)
 {
 	if (!buffer)
@@ -151,7 +175,7 @@ int bin_get_buffer(str *buffer)
 	buffer->s = send_buffer;
 	buffer->len = bin_send_size;
 
-	return 1;
+	return 0;
 }
 
 /*
@@ -269,12 +293,36 @@ int bin_pop_int(void *info)
 
 
 	if (cpos + sizeof(int) > rcv_end) {
-		LM_ERR("Receive binary packet buffer overflow");
+		LM_ERR("Receive binary packet buffer overflow\n");
 		return -1;
 	}
 
 	memcpy(info, cpos, sizeof(int));
 	cpos += sizeof(int);
+
+	return 0;
+}
+
+/*
+ * pops an integer value from the end of the buffer
+ * @info:   pointer to store the result
+ *
+ * @return:
+ *		0 (success): info retrieved
+ *		1 (success): nothing returned, all data has been consumed!
+ *		< 0: error
+ */
+int bin_pop_back_int(void *info) {
+	if (rcv_end == cpos)
+		return 1;
+
+	if (rcv_end - sizeof(int) < rcv_buf) {
+		LM_ERR("Receive binary packet buffer underflow");
+		return -1;
+	}
+
+	memcpy(info, rcv_end - sizeof(int), sizeof(int));
+	rcv_end -= sizeof(int);
 
 	return 0;
 }
@@ -310,7 +358,7 @@ int bin_register_cb(char *mod_name, void (*cb)(int, struct receive_info *, void 
 
 
 /*
- * main binary packet UDP receiver loop
+ * called from proto_bin when a message has been received
  */
 
 
@@ -339,12 +387,4 @@ void call_callbacks(char* buffer, struct receive_info *rcv){
 		}
 	}
 }
-
-
-/*
- * called in the OpenSIPS initialization phase by the main process.
- * forks the binary packet UDP receivers.
- *
- * @return: 0 on success
- */
 

@@ -48,9 +48,8 @@ void replicate_urecord_insert(urecord_t *r)
 	bin_push_str(r->domain);
 	bin_push_str(&r->aor);
 
-	if (clusterer_api.send_all(ul_replicate_cluster) < 0) {
+	if (clusterer_api.send_all(ul_replicate_cluster) < 0)
 		LM_ERR("replicate urecord insert failed\n");
- 	}
 }
 
 void replicate_urecord_delete(urecord_t *r)
@@ -65,9 +64,8 @@ void replicate_urecord_delete(urecord_t *r)
 	bin_push_str(r->domain);
 	bin_push_str(&r->aor);
 
-	if (clusterer_api.send_all(ul_replicate_cluster) < 0) {
-		LM_ERR("replicate urecord delete failed\n");
- 	}	
+	if (clusterer_api.send_all(ul_replicate_cluster) < 0)
+		LM_ERR("replicate urecord delete failed\n");	
 }
 
 void replicate_ucontact_insert(urecord_t *r, str *contact, ucontact_info_t *ci)
@@ -108,10 +106,8 @@ void replicate_ucontact_insert(urecord_t *r, str *contact, ucontact_info_t *ci)
 	st.len = sizeof ci->last_modified;
 	bin_push_str(&st);
 
-	if (clusterer_api.send_all(ul_replicate_cluster) < 0) {
+	if (clusterer_api.send_all(ul_replicate_cluster) < 0)
 		LM_ERR("replicate ucontact insert failed\n");
- 	}
-
 }
 
 void replicate_ucontact_update(urecord_t *r, str *contact, ucontact_info_t *ci)
@@ -152,9 +148,8 @@ void replicate_ucontact_update(urecord_t *r, str *contact, ucontact_info_t *ci)
 	st.len = sizeof ci->last_modified;
 	bin_push_str(&st);
 
-	if (clusterer_api.send_all(ul_replicate_cluster) < 0) {
+	if (clusterer_api.send_all(ul_replicate_cluster) < 0)
 		LM_ERR("replicate ucontact delete failed\n");
- 	}
 }
 
 void replicate_ucontact_delete(urecord_t *r, ucontact_t *c)
@@ -171,9 +166,8 @@ void replicate_ucontact_delete(urecord_t *r, ucontact_t *c)
 	bin_push_str(&c->callid);
 	bin_push_int(c->cseq);
 
-	if (clusterer_api.send_all(ul_replicate_cluster) < 0) {
+	if (clusterer_api.send_all(ul_replicate_cluster) < 0)
 		LM_ERR("replicate ucontact delete failed\n");
- 	}
 }
 
 /* packet receiving */

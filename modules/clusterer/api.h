@@ -3,7 +3,8 @@
 
 #include "../../str.h"
 
-#define CLUSTER_NODE_DOWN -1
+#define UNDEFINED_PACKET_TYPE -1
+#define INVAL_NODE_ID -1
 
 enum cl_node_state {
     STATE_DISABLED,
@@ -18,32 +19,51 @@ typedef struct clusterer_node {
     struct clusterer_node *next;
 } clusterer_node_t;
 
+enum clusterer_send_ret {
+    CLUSTERER_SEND_SUCCES = 0,
+    CLUSTERER_CURR_DISABLED = 1,  /* current node disabled */
+    CLUSTERER_DEST_DISABLED = -1, /* destination node(s) disabled */
+    CLUSTERER_DEST_DOWN = -2,     /* destination node(s) down or probing */
+    CLUSTERER_SEND_ERR = -3,      /* error */
+};
+
+enum clusterer_event {
+    /* node with id provided in the @dest_id param of clusterer_cb_f is unreachable */
+    CLUSTER_NODE_DOWN,
+    /* failed to route received message (source and destination nodes
+     * provided in clusterer_cb_f params) */
+    CLUSTER_ROUTE_FAILED,
+    /* received message for current node */
+    CLUSTER_RECV_MSG
+};
+
 /* returns the list of reachable nodes in the cluster */
-typedef clusterer_node_t *(*get_nodes_f) (int cluster_id);
+typedef clusterer_node_t* (*get_nodes_f)(int cluster_id);
 
 /* free the list returned by the get_nodes_f function */
-typedef void (*free_nodes_f) (clusterer_node_t *list);
+typedef void (*free_nodes_f)(clusterer_node_t *list);
 
 /* sets the state (enabled or disabled) of a node from a cluster */
-typedef int (*set_state_f) (int cluster_id, int node_id, enum cl_node_state state);
+typedef int (*set_state_f)(int cluster_id, int node_id, enum cl_node_state state);
 
 /* get the node id of the current node */
-typedef int (*get_my_id_f) (void);
+typedef int (*get_my_id_f)(void);
 
 /* send message to specified node in the cluster */
-typedef int (*send_to_f) (int cluster_id, int node_id);
+typedef enum clusterer_send_ret (*send_to_f)(int cluster_id, int node_id);
 
 /* send message to all nodes in the cluster */
-typedef int (*send_all_f) (int cluster_id);
+typedef enum clusterer_send_ret (*send_all_f)(int cluster_id);
 
 /*
  * This function will be called for every binary packet received or
- * to signal certain cluster events
+ * to signal certain cluster events.
  */
-typedef void (*clusterer_cb_f)(int cmd_type, struct receive_info *ri, int node_id);
+typedef void (*clusterer_cb_f)(enum clusterer_event ev, int packet_type,
+                                struct receive_info *ri, int src_id, int dest_id);
 
 /* Register module to clusterer */
-typedef int (*register_module_f) (char *mod_name, int proto,  clusterer_cb_f cb,
+typedef int (*register_module_f)(char *mod_name, int proto,  clusterer_cb_f cb,
                                     int auth_check, int accept_cluster_id);
 
 struct clusterer_binds {
@@ -56,7 +76,7 @@ struct clusterer_binds {
     register_module_f register_module;
 };
 
-typedef int(*load_clusterer_f)(struct clusterer_binds *binds);
+typedef int (*load_clusterer_f)(struct clusterer_binds *binds);
 
 int load_clusterer(struct clusterer_binds *binds);
 

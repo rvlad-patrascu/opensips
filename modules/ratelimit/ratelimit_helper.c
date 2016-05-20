@@ -1005,7 +1005,7 @@ void rl_timer_repl(utime_t ticks, void *param)
 		LM_ERR("cannot initiate bin buffer\n");
 		return;
 	}
-	bin_push_int(clusterer_api.get_my_id());
+	/* bin_push_int(clusterer_api.get_my_id()); */
 
 	/* iterate through each map */
 	for (i = 0; i < rl_htable.size; i++) {
@@ -1053,7 +1053,7 @@ void rl_timer_repl(utime_t ticks, void *param)
 					RL_RELEASE_LOCK(i);
 					return;
 				}
-				bin_push_int(clusterer_api.get_my_id());
+				/* bin_push_int(clusterer_api.get_my_id()); */
 				nr = 0;
 			}
 

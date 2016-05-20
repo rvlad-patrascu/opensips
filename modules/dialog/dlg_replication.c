@@ -525,6 +525,7 @@ void replicate_dialog_updated(struct dlg_cell *dlg)
 	callee_leg = callee_idx(dlg);
 
 	bin_push_int(clusterer_api.get_my_id());
+
 	bin_push_str(&dlg->callid);
 	bin_push_str(&dlg->legs[DLG_CALLER_LEG].tag);
 	bin_push_str(&dlg->legs[callee_leg].tag);
@@ -590,6 +591,7 @@ void replicate_dialog_deleted(struct dlg_cell *dlg)
 		goto error;
 
 	bin_push_int(clusterer_api.get_my_id());
+
 	bin_push_str(&dlg->callid);
 	bin_push_str(&dlg->legs[DLG_CALLER_LEG].tag);
 	bin_push_str(&dlg->legs[callee_idx(dlg)].tag);
@@ -603,15 +605,15 @@ error:
 	LM_ERR("Failed to replicate deleted dialog\n");
 }
 
-/**
- * receive_binary_packet (callback) - receives a cmd_type, specifying the
- * purpose of the data encoded in the received UDP packet
- */
-void receive_prof_binary_packet(int packet_type, struct receive_info *ri,
-																int server_id)
+void receive_prof_binary_packet(enum clusterer_event ev, int packet_type,
+                                struct receive_info *ri, int src_id, int dest_id)
 {
-	if (packet_type == CLUSTER_NODE_DOWN) {
-		LM_INFO("server with clusterer id %d timeout\n", server_id);
+	if (ev == CLUSTER_NODE_DOWN) {
+		LM_INFO("node %d is down\n", dest_id);
+		return;
+	} else if (ev == CLUSTER_ROUTE_FAILED) {
+		LM_INFO("failed to route replication packet of type %d from node %d to node %d\n",
+			packet_type, src_id, dest_id);
 		return;
 	}
 
@@ -619,7 +621,7 @@ void receive_prof_binary_packet(int packet_type, struct receive_info *ri,
 		LM_WARN("bad packet type\n");
 		return;
 	}
-	dlg_replicated_profiles(ri, server_id);
+	dlg_replicated_profiles(ri, node_id);
 }
 
 void receive_dlg_binary_packet(int packet_type, struct receive_info *ri, void *att)
@@ -760,9 +762,8 @@ int repl_prof_init(void)
 /* profiles replication */
 static inline void dlg_replicate_profiles(void)
 {
-	if (clusterer_api.send_all(profile_replicate_cluster) < 0) {
+	if (clusterer_api.send_all(profile_replicate_cluster) < 0)
  		goto error;
-	}
 
 	return;
 error:
@@ -946,7 +947,7 @@ int repl_prof_remove(str *name, str *value)
 		return -1;
 	}
 
-	bin_push_int(clusterer_api.get_my_id());
+	/* bin_push_int(clusterer_api.get_my_id()); */
 
 	if (repl_prof_add(name, value?1:0, value, 0) < 0)
 		return -1;
@@ -1037,7 +1038,7 @@ static void repl_prof_utimer_f(utime_t ticks, void *param)
 				LM_ERR("cannot initiate bin buffer\n"); \
 				return; \
 			} \
-			bin_push_int(clusterer_api.get_my_id()); \
+			/* bin_push_int(clusterer_api.get_my_id()); */ \
 			nr = 0; \
 		} \
 	} while (0)
@@ -1056,7 +1057,7 @@ static void repl_prof_utimer_f(utime_t ticks, void *param)
 		LM_ERR("cannot initiate bin buffer\n");
 		return;
 	}
-	bin_push_int(clusterer_api.get_my_id());
+	/* bin_push_int(clusterer_api.get_my_id()); */
 
 	for (profile = profiles; profile; profile = profile->next) {
 		if (!(profile->repl_type&REPL_PROTOBIN))
